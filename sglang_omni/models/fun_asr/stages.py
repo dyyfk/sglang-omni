@@ -119,6 +119,14 @@ def create_sglang_fun_asr_executor(
     request_build_max_pending: int | None = 16,
     server_args_overrides: dict[str, Any] | None = None,
 ):
+    if pre_lm_max_batch_size < 1:
+        raise ValueError(
+            f"pre_lm_max_batch_size must be >= 1, got {pre_lm_max_batch_size}"
+        )
+    if pre_lm_max_batch_wait_ms < 0:
+        raise ValueError(
+            f"pre_lm_max_batch_wait_ms must be >= 0, got {pre_lm_max_batch_wait_ms}"
+        )
 
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 

@@ -465,7 +465,7 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
                     "Fun-ASR audio item is missing feature (input_features); "
                     "cannot encode"
                 )
-            feature = item.feature.to(device=device, dtype=dtype)
+            feature = item.feature
             if feature.ndim != 3 or feature.shape[0] != 1:
                 raise ValueError(
                     "Fun-ASR expects item.feature shaped [1, input_size, T], "
@@ -473,7 +473,7 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
                 )
             mask = getattr(item, "feature_attention_mask", None)
             if mask is not None:
-                valid = int(mask.to(device=device).sum().item())
+                valid = int(mask.sum().item())
             else:
                 valid = int(feature.shape[-1])
             valid = max(valid, 1)
@@ -487,13 +487,13 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
         for i, (feat, length) in enumerate(zip(feats, lengths)):
             batched[i, :, :length] = feat[0, :, :length]
 
-        xs = batched.permute(0, 2, 1).contiguous()  # [B, T_max, D]
-        ilens = torch.tensor(lengths, device=device, dtype=torch.long)
+        xs = batched.permute(0, 2, 1).to(device=device, dtype=dtype, non_blocking=True)
         # note (guozhihao): skip masking for the common B=1 unpadded path so it
         # stays bit-identical to the pre-batching encoder forward.
         if batch_size == 1 and lengths[0] == t_max:
             sanm_mask: Optional[torch.Tensor] = None
         else:
+            ilens = torch.tensor(lengths, device=device, dtype=torch.long)
             sanm_mask = _sanm_mask_from_lengths(
                 ilens, t_max, dtype=xs.dtype, device=device
             )
