@@ -487,9 +487,13 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
         for i, (feat, length) in enumerate(zip(feats, lengths)):
             batched[i, :, :length] = feat[0, :, :length]
 
-        xs = batched.permute(0, 2, 1).to(device=device, dtype=dtype, non_blocking=True)
+        xs = (
+            batched.permute(0, 2, 1)
+            .contiguous()
+            .to(device=device, dtype=dtype, non_blocking=True)
+        )
         # note (guozhihao): skip masking for the common B=1 unpadded path so it
-        # stays bit-identical to the pre-batching encoder forward.
+        # stays numerically equivalent to the unmasked encoder forward.
         if batch_size == 1 and lengths[0] == t_max:
             sanm_mask: Optional[torch.Tensor] = None
         else:
