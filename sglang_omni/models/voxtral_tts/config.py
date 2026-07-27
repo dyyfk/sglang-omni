@@ -20,6 +20,10 @@ class VoxtralTTSPipelineConfig(PipelineConfig):
     requires_model_capabilities: ClassVar[bool] = True
 
     @classmethod
+    def mem_fraction_role_to_stage(cls) -> dict[str, str]:
+        return {"talker": GENERATION_STAGE}
+
+    @classmethod
     def generation_sglang_role_to_stage(cls) -> dict[str, str]:
         return {"generation": "tts_generation"}
 

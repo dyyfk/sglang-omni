@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -50,6 +51,19 @@ def store_state(payload: StagePayload, state: MossTTSState) -> StagePayload:
 
 def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     return getattr(torch, dtype) if isinstance(dtype, str) else dtype
+
+
+def _resolve_vocoder_dtype(device: str, dtype: str) -> str:
+    override = os.getenv("MOSS_TTS_VOCODER_DTYPE")
+    if override:
+        return override
+    if (
+        dtype == "float32"
+        and device.startswith("cuda")
+        and torch.cuda.get_device_properties(device).total_memory < 32 * 1024**3
+    ):
+        return "bfloat16"
+    return dtype
 
 
 def _normalize_moss_processor_config(processor: Any) -> None:
@@ -135,9 +149,10 @@ create_tts_engine_executor = create_sglang_tts_engine_executor
 
 
 class _MossTTSVocoder(BatchVocoderBase):
-    def __init__(self, processor: Any, device: str) -> None:
+    def __init__(self, processor: Any, device: str, dtype: str) -> None:
         self._processor = processor
         self._device = device
+        self._dtype = dtype
 
     def prepare_item(self, payload: StagePayload) -> tuple[MossTTSState, torch.Tensor]:
         state = load_state(payload)
@@ -168,7 +183,12 @@ class _MossTTSVocoder(BatchVocoderBase):
         )
         decoded = []
         for segment in segments:
-            decoded.extend(self._processor.decode_audio_codes([segment]))
+            with torch.autocast(
+                device_type="cuda",
+                dtype=_torch_dtype(self._dtype),
+                enabled=self._device.startswith("cuda") and self._dtype != "float32",
+            ):
+                decoded.extend(self._processor.decode_audio_codes([segment]))
         if not decoded:
             raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
         waveforms = [
@@ -225,9 +245,10 @@ def create_vocoder_executor(
 ) -> SimpleScheduler:
     if gpu_id is not None:
         device = f"cuda:{gpu_id}"
+    dtype = _resolve_vocoder_dtype(device, dtype)
     processor = _load_moss_processor(model_path, device=device, dtype=dtype)
 
-    return _MossTTSVocoder(processor, device).build_scheduler(
+    return _MossTTSVocoder(processor, device, dtype).build_scheduler(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )

@@ -161,6 +161,21 @@ def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
     return "cuda:0"
 
 
+def _resolve_preprocessing_codec_device(device: str) -> str:
+    override = os.environ.get("MOSS_TTS_LOCAL_PREPROCESSING_DEVICE")
+    if override:
+        return override
+    if device.startswith("cuda"):
+        device_index = torch.device(device).index or 0
+        if torch.cuda.get_device_properties(device_index).total_memory < 32 * 1024**3:
+            logger.info(
+                "Using CPU for MOSS-TTS Local reference encoding on a GPU with "
+                "<32 GiB VRAM; set MOSS_TTS_LOCAL_PREPROCESSING_DEVICE to override"
+            )
+            return "cpu"
+    return device
+
+
 def _load_moss_tts_local_processor(model_path: str) -> Any:
     checkpoint_dir = resolve_moss_checkpoint(model_path)
     logger.info(f"Loading MOSS-TTS Local processor from {checkpoint_dir} without codec")
@@ -505,7 +520,7 @@ def create_preprocessing_executor(
             "off",
             "",
         )
-    device = _resolve_codec_device(device, gpu_id)
+    device = _resolve_preprocessing_codec_device(_resolve_codec_device(device, gpu_id))
     processor = _load_moss_tts_local_processor(model_path)
     audio_tokenizer = load_moss_tts_local_audio_tokenizer(
         _resolve_audio_tokenizer_model_path(processor, codec_model_path),

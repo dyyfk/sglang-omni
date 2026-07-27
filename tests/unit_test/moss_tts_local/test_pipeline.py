@@ -765,6 +765,20 @@ def _payload(text: str = "hello") -> StagePayload:
     )
 
 
+def test_preprocessing_codec_uses_cpu_on_low_vram(monkeypatch):
+    from sglang_omni.models.moss_tts_local import stages
+
+    monkeypatch.setattr(
+        stages.torch.cuda,
+        "get_device_properties",
+        lambda _device: types.SimpleNamespace(total_memory=24 * 1024**3),
+    )
+    assert stages._resolve_preprocessing_codec_device("cuda:0") == "cpu"
+
+    monkeypatch.setenv("MOSS_TTS_LOCAL_PREPROCESSING_DEVICE", "cuda:0")
+    assert stages._resolve_preprocessing_codec_device("cuda:0") == "cuda:0"
+
+
 def test_create_preprocessing_executor_cache_toggles(monkeypatch):
     from sglang_omni.models.moss_tts_local import request_builders as rb
     from sglang_omni.models.moss_tts_local import stages

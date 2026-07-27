@@ -272,6 +272,21 @@ def test_moss_tts_talker_torch_compile_cli_override_targets_tts_engine() -> None
     assert server_args_overrides["torch_compile_max_bs"] == 4
 
 
+def test_moss_tts_vocoder_uses_bfloat16_on_low_vram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts import stages
+
+    monkeypatch.delenv("MOSS_TTS_VOCODER_DTYPE", raising=False)
+    monkeypatch.setattr(
+        stages.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(total_memory=24 * 1024**3),
+    )
+    assert stages._resolve_vocoder_dtype("cuda:0", "float32") == "bfloat16"
+    assert stages._resolve_vocoder_dtype("cpu", "float32") == "float32"
+
+
 def test_moss_tts_vocoder_uses_batch_base_path(monkeypatch: pytest.MonkeyPatch) -> None:
     from sglang_omni.models.moss_tts import stages
 
