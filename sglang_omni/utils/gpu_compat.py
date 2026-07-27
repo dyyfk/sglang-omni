@@ -20,6 +20,37 @@ logger = logging.getLogger(__name__)
 
 _FLASHINFER_USE_CUDA_NORM = "FLASHINFER_USE_CUDA_NORM"
 
+_GPU_ARCHITECTURES = {
+    89: "ada",
+    90: "hopper",
+    100: "blackwell-datacenter",
+    120: "blackwell-consumer",
+}
+
+
+def gpu_architecture_for_sm(sm_version: int | None) -> str:
+    """Return the CUDA architecture family without conflating SM100 and SM120."""
+    if sm_version is None:
+        return "unknown"
+    return _GPU_ARCHITECTURES.get(sm_version, f"sm{sm_version}")
+
+
+def architecture_supports_flash_attention_3(sm_version: int | None) -> bool:
+    """Return whether the GPU architecture can run the FA3 backend."""
+    return sm_version == 90
+
+
+def architecture_supports_flash_attention_4(sm_version: int | None) -> bool:
+    """Return whether the GPU architecture can run the FA4 backend."""
+    return sm_version == 100
+
+
+def preferred_sglang_attention_backend(sm_version: int | None) -> str:
+    """Choose a backend by architecture; package availability is checked downstream."""
+    return (
+        "fa3" if architecture_supports_flash_attention_3(sm_version) else "flashinfer"
+    )
+
 
 def _get_compute_capability(
     logical_gpu_id: int,

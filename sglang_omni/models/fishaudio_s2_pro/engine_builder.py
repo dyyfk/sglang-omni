@@ -10,6 +10,10 @@ from typing import Any
 from sglang_omni.models.fishaudio_s2_pro import request_builders
 from sglang_omni.models.fishaudio_s2_pro import stages as fish_stages
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.utils.gpu_compat import (
+    get_visible_gpu_sm_version,
+    preferred_sglang_attention_backend,
+)
 
 
 class FishS2ProEngineBuilder(TtsEngineBuilder):
@@ -52,7 +56,9 @@ class FishS2ProEngineBuilder(TtsEngineBuilder):
     def customize_server_args(self, server_args: Any) -> None:
         server_args.disable_overlap_schedule = True
         if getattr(server_args, "attention_backend", None) is None:
-            server_args.attention_backend = "fa3"
+            server_args.attention_backend = preferred_sglang_attention_backend(
+                get_visible_gpu_sm_version(0)
+            )
 
     def setup_model(
         self,

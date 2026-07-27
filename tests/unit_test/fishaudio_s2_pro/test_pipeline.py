@@ -16,6 +16,7 @@ import typer
 
 from sglang_omni.cli.serve import apply_torch_compile_cli_overrides
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
+from sglang_omni.models.fishaudio_s2_pro.engine_builder import FishS2ProEngineBuilder
 from sglang_omni.models.fishaudio_s2_pro.fish_speech.tokenizer import (
     IM_END_TOKEN,
     IM_START_TOKEN,
@@ -101,6 +102,26 @@ def test_fish_config_state_and_tokenizer_prompt_contracts() -> None:
     assert prompt["vq_mask_tokens"].sum().item() == 2
     assert torch.equal(prompt["vq_parts"][0], torch.tensor([[0, 1], [10, 11]]))
     assert any("<|speaker:alice|>target" in text for text in tokenizer.encoded_texts)
+
+
+@pytest.mark.parametrize("sm_version,expected", [(89, "flashinfer"), (90, "fa3")])
+def test_fish_attention_backend_follows_gpu_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    sm_version: int,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(
+        "sglang_omni.models.fishaudio_s2_pro.engine_builder.get_visible_gpu_sm_version",
+        lambda _gpu_id: sm_version,
+    )
+    server_args = SimpleNamespace(attention_backend=None)
+
+    FishS2ProEngineBuilder(max_new_tokens=32, ras_window=0).customize_server_args(
+        server_args
+    )
+
+    assert server_args.attention_backend == expected
+    assert server_args.disable_overlap_schedule is True
 
 
 @pytest.mark.parametrize(
