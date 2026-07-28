@@ -180,6 +180,93 @@ def launch_managed_router(
         cleanup_process_groups_from_manifest(cleanup_manifest)
 
 
+def build_external_router_command(
+    *,
+    python_bin: str,
+    router_port: int,
+    worker_urls: list[str],
+    model_name: str,
+) -> list[str]:
+    if len(worker_urls) != 2:
+        raise ValueError("same-GPU MPS validation requires exactly two workers")
+    return [
+        python_bin,
+        "-m",
+        "sglang_omni_router.serve",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(router_port),
+        "--worker-urls",
+        *worker_urls,
+        "--model",
+        model_name,
+        "--policy",
+        ROUTER_POLICY,
+        "--health-success-threshold",
+        "1",
+        "--health-failure-threshold",
+        "2",
+        "--health-check-interval-secs",
+        "2",
+        "--log-level",
+        "info",
+    ]
+
+
+@contextmanager
+def launch_router_for_workers(
+    *,
+    tmp_path_factory: pytest.TempPathFactory,
+    worker_urls: list[str],
+    model_name: str,
+    wait_timeout: int,
+    log_prefix: str,
+) -> Iterator[ManagedRouterHandle]:
+    worker_ports = [int(url.rsplit(":", 1)[-1]) for url in worker_urls]
+    router_port = _find_available_port_excluding(worker_ports)
+    cleanup_manifest = (
+        tmp_path_factory.mktemp("external_router_cleanup") / "router_pgids.txt"
+    )
+    router_log = server_log_file(tmp_path_factory, log_prefix)
+    router_proc: subprocess.Popen | None = None
+    handle: ManagedRouterHandle | None = None
+    try:
+        started = time.perf_counter()
+        router_proc = start_server_from_cmd(
+            build_external_router_command(
+                python_bin=sys.executable,
+                router_port=router_port,
+                worker_urls=worker_urls,
+                model_name=model_name,
+            ),
+            router_log,
+            router_port,
+            timeout=wait_timeout,
+        )
+        _record_process_group(cleanup_manifest, os.getpgid(router_proc.pid))
+        wait_for_all_router_workers(
+            router_port,
+            expected_workers=len(worker_urls),
+            timeout=wait_timeout,
+        )
+        handle = ManagedRouterHandle(
+            proc=router_proc,
+            port=router_port,
+            worker_ports=worker_ports,
+            log_file=router_log,
+            cleanup_manifest=cleanup_manifest,
+            router_ready_s=time.perf_counter() - started,
+        )
+        yield handle
+    finally:
+        if handle is not None:
+            handle.stop()
+        elif router_proc is not None:
+            stop_server(router_proc)
+        cleanup_process_groups_from_manifest(cleanup_manifest)
+
+
 @contextmanager
 def router_worker_traffic_guard(
     handle: ManagedRouterHandle,
