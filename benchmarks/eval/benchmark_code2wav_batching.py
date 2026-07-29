@@ -162,6 +162,10 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
             total_upsample=model.total_upsample,
             sample_rate=args.sample_rate,
         )
+    device = torch.device(args.device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    args.device = str(device)
     model = load_code2wav_model(args.model_path, device=args.device, dtype=args.dtype)
     graph_runner = None
     if "serial-graph" in args.arms:
