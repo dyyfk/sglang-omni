@@ -88,7 +88,14 @@ class Code2WavStreamState:
 
 
 class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
-    """Streaming vocoder scheduler. Same inbox/outbox interface as OmniScheduler."""
+    """Streaming vocoder scheduler. Same inbox/outbox interface as OmniScheduler.
+
+    With batching and the CUDA graph runner both enabled, dispatch is
+    shape-quantized: each step consumes exactly ``stream_chunk_size`` new
+    frames (a backlog drains over repeated uniform steps), so every window
+    stays inside the serial graph key set and size-1 dispatches replay the
+    serial CUDA graph while multi-request groups run one eager forward.
+    """
 
     def __init__(
         self,
@@ -105,10 +112,6 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         enable_cuda_graph: bool = False,
         _cuda_graph_runner: Code2WavCudaGraphRunner | None = None,
     ):
-        if enable_batching and enable_cuda_graph:
-            raise ValueError(
-                "Code2Wav batching and CUDA Graph cannot be enabled together"
-            )
         self._model = model
         self._device = torch.device(device)
         self._stream_chunk_size = max(int(stream_chunk_size), 1)
@@ -136,6 +139,9 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self._can_batch_stream_chunks = self._enable_batching
         if self._enable_batching:
             self._stream_chunk_batch_max = self._batch_ceiling
+        self._quantized_dispatch = (
+            self._enable_batching and self._cuda_graph_runner is not None
+        )
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         del payload
@@ -330,9 +336,18 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def _ready(self, state: Code2WavStreamState) -> int:
         return len(state.chunks) - state.emitted
 
+    def _step_frames(self, state: Code2WavStreamState) -> int:
+        """New frames the next step consumes. Quantized dispatch caps each
+        step at one stream chunk so windows stay inside the serial graph key
+        set and buckets stay comparable regardless of per-request backlog."""
+        ready = self._ready(state)
+        if self._quantized_dispatch:
+            return min(ready, self._stream_chunk_size)
+        return ready
+
     def _bucket(self, state: Code2WavStreamState) -> tuple[int, int]:
         context = min(self._left_context_size, state.emitted)
-        return (context, context + self._ready(state))
+        return (context, context + self._step_frames(state))
 
     @staticmethod
     def _decompose_batch(n: int) -> list[int]:
@@ -421,7 +436,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             profile_metadata = {
                 "batch_size": len(participants),
                 "bucket": list(bucket),
-                "new_frames": self._ready(first_state),
+                "new_frames": self._step_frames(first_state),
                 "window_frames": bucket[1],
                 "active_request_count": len(self._stream_states),
                 "inbox_depth": self.inbox.qsize(),
@@ -449,7 +464,8 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             rows = []
             window_ends: list[int] = []
             for _, state in group:
-                start, end = state.emitted, len(state.chunks)
+                start = state.emitted
+                end = start + self._step_frames(state)
                 window_ends.append(end)
                 context = min(self._left_context_size, start)
                 rows.append(
@@ -467,7 +483,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             codes = torch.stack(rows, dim=0)
             wav, execution_metadata = self._forward_codes(
                 codes,
-                graph_eligible=False,
+                graph_eligible=self._quantized_dispatch and len(group) == 1,
             )
             if wav.shape[0] != len(group):
                 raise RuntimeError(
@@ -527,8 +543,6 @@ def create_code2wav_scheduler(
     total_gpu_memory_fraction: float | None = None,
 ):
     """Factory: returns Code2WavScheduler."""
-    if enable_batching and enable_cuda_graph:
-        raise ValueError("Code2Wav batching and CUDA Graph cannot be enabled together")
     if enable_cuda_graph and total_gpu_memory_fraction is None:
         raise ValueError(
             "Code2Wav CUDA graph requires "

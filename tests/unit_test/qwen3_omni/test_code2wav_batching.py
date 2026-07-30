@@ -8,13 +8,36 @@ import time
 import numpy as np
 import torch
 
+from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
+    Code2WavRunResult,
+    GraphKey,
+)
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
     Code2WavStreamState,
+    _serial_threshold_graph_keys,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.scheduling.messages import IncomingMessage
 from tests.unit_test.fixtures.qwen_fakes import FakeCode2WavModel
+
+
+class _FakeGraphRunner:
+    def __init__(self, model, keys) -> None:
+        self._model = model
+        self._keys = set(keys)
+        self.calls: list[tuple[tuple[int, ...], bool, str]] = []
+
+    def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
+        key = GraphKey(batch_size=int(codes.shape[0]), frames=int(codes.shape[-1]))
+        if eligible and key in self._keys:
+            mode, reason = "cuda_graph", None
+        elif eligible:
+            mode, reason = "eager", "key_miss"
+        else:
+            mode, reason = "eager", "ineligible"
+        self.calls.append((tuple(codes.shape), eligible, mode))
+        return Code2WavRunResult(self._model(codes), mode, key, reason)
 
 
 def _make_batching_scheduler(**kwargs) -> Code2WavScheduler:
@@ -25,6 +48,22 @@ def _make_batching_scheduler(**kwargs) -> Code2WavScheduler:
         left_context_size=1,
         sample_rate=24000,
         enable_batching=True,
+        **kwargs,
+    )
+
+
+def _make_quantized_scheduler(**kwargs) -> Code2WavScheduler:
+    model = FakeCode2WavModel(total_upsample=2)
+    runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
+    return Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        sample_rate=24000,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        _cuda_graph_runner=runner,
         **kwargs,
     )
 
@@ -442,3 +481,86 @@ def test_batch_events_emitted(monkeypatch) -> None:
     assert start_meta["due_bucket_count"] == 1
     assert end_meta["audio_samples"] > 0
     assert end_meta["execution_mode"] == "eager"
+
+
+def test_batching_and_cuda_graph_coexist() -> None:
+    scheduler = _make_quantized_scheduler()
+    assert scheduler._quantized_dispatch is True
+    assert scheduler._cuda_graph_runner is not None
+    legacy = _make_batching_scheduler()
+    assert legacy._quantized_dispatch is False
+
+
+def test_quantized_step_plan_decomposes() -> None:
+    scheduler = _make_quantized_scheduler()
+    participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
+    assert scheduler.build_step_plan(participants) == [4, 2, 1]
+
+
+def test_quantized_backlog_drains_in_uniform_graph_windows() -> None:
+    scheduler = _make_quantized_scheduler(max_batch_wait_ms=0, batch_floor=2)
+    _feed_batch(scheduler, [("req-1", code) for code in (1, 2, 3, 4, 5, 6)])
+    assert scheduler._model.calls == [(1, 2, 2), (1, 2, 3), (1, 2, 3)]
+    assert scheduler._stream_states["req-1"].emitted == 6
+    runner = scheduler._cuda_graph_runner
+    assert [mode for _, _, mode in runner.calls] == ["cuda_graph"] * 3
+
+
+def test_quantized_buckets_merge_mixed_backlogs() -> None:
+    scheduler = _make_quantized_scheduler(max_batch_wait_ms=0, batch_floor=2)
+    _feed_batch(scheduler, [("req-a", 1), ("req-a", 2)])
+    _feed_batch(scheduler, [("req-b", 3), ("req-b", 4)])
+    _drain_outbox(scheduler)
+    _feed_batch(
+        scheduler,
+        [
+            ("req-a", 5),
+            ("req-a", 6),
+            ("req-b", 7),
+            ("req-b", 8),
+            ("req-b", 9),
+            ("req-b", 10),
+        ],
+    )
+    # Legacy buckets isolate ready=2 from ready=4 (see test_bucket_isolation);
+    # quantized buckets collapse to (context, context+chunk) and merge them.
+    assert scheduler._model.calls[2:] == [(2, 2, 3), (1, 2, 3)]
+    assert scheduler._stream_states["req-a"].emitted == 4
+    assert scheduler._stream_states["req-b"].emitted == 6
+    runner = scheduler._cuda_graph_runner
+    assert [(call[1], call[2]) for call in runner.calls[-2:]] == [
+        (False, "eager"),
+        (True, "cuda_graph"),
+    ]
+
+
+def test_quantized_waveforms_match_serial_reference() -> None:
+    schedule = {
+        "req-1": [1, 2, 3, 4, 5, 6],
+        "req-2": [7, 8, 9, 10, 11, 12],
+    }
+
+    control = Code2WavScheduler(
+        FakeCode2WavModel(total_upsample=2),
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        sample_rate=24000,
+    )
+    for rid, codes in schedule.items():
+        for code in codes:
+            control._handle_stream_chunk(rid, _stream_item(code))
+
+    quantized = _make_quantized_scheduler(max_batch_wait_ms=0, batch_floor=2)
+    _feed_batch(
+        quantized,
+        [(rid, code) for rid, codes in schedule.items() for code in codes],
+    )
+
+    assert any(call[0] > 1 for call in quantized._model.calls)
+    for rid in schedule:
+        assert quantized._stream_states[rid].emitted == 6
+        assert np.array_equal(
+            np.concatenate(control._stream_states[rid].audio_parts),
+            np.concatenate(quantized._stream_states[rid].audio_parts),
+        )
