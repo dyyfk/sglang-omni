@@ -161,28 +161,33 @@ def test_qwen_code2wav_enabled_factory_rejects_missing_typed_budget_before_load(
     assert load_calls == 0
 
 
-def test_qwen_code2wav_factory_rejects_batching_with_cuda_graph_before_load(
+def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
     monkeypatch,
 ) -> None:
-    load_calls = 0
+    model = _FactoryModel(num_quantizers=12)
+    runner = SimpleNamespace(
+        stats=lambda: {"enabled": True, "disable_reason": None}
+    )
+    monkeypatch.setattr(
+        code2wav_scheduler, "load_code2wav_model", lambda *a, **k: model.eval()
+    )
+    monkeypatch.setattr(
+        code2wav_scheduler.Code2WavCudaGraphRunner,
+        "build",
+        staticmethod(lambda *args, **kwargs: runner),
+    )
 
-    def _load(*args, **kwargs):
-        nonlocal load_calls
-        load_calls += 1
-        return _FactoryModel()
+    scheduler = code2wav_scheduler.create_code2wav_scheduler(
+        "dummy",
+        device="cuda:0",
+        enable_batching=True,
+        enable_cuda_graph=True,
+        total_gpu_memory_fraction=0.02,
+    )
 
-    monkeypatch.setattr(code2wav_scheduler, "load_code2wav_model", _load)
-
-    with pytest.raises(ValueError, match="cannot be enabled together"):
-        code2wav_scheduler.create_code2wav_scheduler(
-            "dummy",
-            device="cuda:0",
-            enable_batching=True,
-            enable_cuda_graph=True,
-            total_gpu_memory_fraction=0.02,
-        )
-
-    assert load_calls == 0
+    assert scheduler._enable_batching is True
+    assert scheduler._cuda_graph_runner is runner
+    assert scheduler._quantized_dispatch is True
 
 
 @pytest.mark.parametrize(
