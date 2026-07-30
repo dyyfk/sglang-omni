@@ -6,11 +6,14 @@ c1-8 showed no change because Talker windows rarely align, so batching seldom
 fires. This harness drives ``Code2WavScheduler`` directly through its
 inbox/outbox contract with synthetic codec streams and sweeps
 ``max_batch_wait_ms`` x ``batch_floor`` (issue #1026, roadmap #1018 item 4.2)
-across three arms:
+across four arms:
 
 - ``serial-eager``: batching off, CUDA graph off (#1126's control)
 - ``serial-graph``: batching off, CUDA graph on (production default, #1101)
-- ``batched``: batching on (CUDA graph is mutually exclusive today)
+- ``batched``: batching on, CUDA graph off (#1126's bounded-wait/floor policy)
+- ``quantized``: batching and CUDA graph both on — shape-quantized zero-wait
+  dispatch (perf/code2wav-adaptive-dispatch); wait/floor pinned to 0/1 since
+  zero wait fires every due bucket immediately
 
 Arrival modes:
 
@@ -66,7 +69,7 @@ from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage
 
-ARM_CHOICES = ("serial-eager", "serial-graph", "batched")
+ARM_CHOICES = ("serial-eager", "serial-graph", "batched", "quantized")
 MODE_CHOICES = ("aligned", "staggered")
 
 
@@ -168,7 +171,7 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
     args.device = str(device)
     model = load_code2wav_model(args.model_path, device=args.device, dtype=args.dtype)
     graph_runner = None
-    if "serial-graph" in args.arms:
+    if "serial-graph" in args.arms or "quantized" in args.arms:
         from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
             Code2WavCudaGraphRunner,
         )
@@ -198,18 +201,19 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
 def build_scheduler(
     ctx: ModelContext, arm: str, args: argparse.Namespace, wait_ms: int, floor: int
 ) -> InstrumentedCode2Wav:
+    graph_arm = arm in ("serial-graph", "quantized")
     return InstrumentedCode2Wav(
         ctx.model,
         device=ctx.device,
         stream_chunk_size=args.stream_chunk_size,
         left_context_size=args.left_context_size,
         sample_rate=ctx.sample_rate,
-        enable_batching=arm == "batched",
+        enable_batching=arm in ("batched", "quantized"),
         max_batch_wait_ms=wait_ms,
         batch_floor=floor,
         batch_ceiling=args.ceiling,
-        enable_cuda_graph=arm == "serial-graph",
-        _cuda_graph_runner=ctx.graph_runner if arm == "serial-graph" else None,
+        enable_cuda_graph=graph_arm,
+        _cuda_graph_runner=ctx.graph_runner if graph_arm else None,
     )
 
 
@@ -397,7 +401,7 @@ def run_single(
         "mode": mode,
         "max_batch_wait_ms": wait_ms,
         "batch_floor": floor,
-        "batch_ceiling": args.ceiling if arm == "batched" else None,
+        "batch_ceiling": args.ceiling if arm in ("batched", "quantized") else None,
         "repeat": repeat,
         "errors": clock.errors,
     }
@@ -469,9 +473,13 @@ def run_single(
 
 
 def run_equivalence(
-    ctx: ModelContext, args: argparse.Namespace, *, streams: int
+    ctx: ModelContext,
+    args: argparse.Namespace,
+    *,
+    streams: int,
+    candidate_arm: str = "batched",
 ) -> dict[str, Any]:
-    """Lockstep batched-vs-serial decode on identical codes.
+    """Lockstep candidate-vs-serial decode on identical codes.
 
     Free-running window boundaries are timing-dependent, so waveforms are only
     well-defined under lockstep feeding: every stream advances one aligned
@@ -487,7 +495,7 @@ def run_equivalence(
         frame_interval_s=0.0,
     )
     control = build_scheduler(ctx, "serial-eager", args, 0, 1)
-    batched = build_scheduler(ctx, "batched", args, 0, 2)
+    batched = build_scheduler(ctx, candidate_arm, args, 0, 2)
     chunk = args.stream_chunk_size
     frames = plans[0].codes.shape[0]
     for plan in plans:
@@ -509,6 +517,7 @@ def run_equivalence(
 
     batched_forwards = [entry["batch"] for entry in batched.forward_log]
     report: dict[str, Any] = {
+        "candidate_arm": candidate_arm,
         "streams": streams,
         "windows": args.windows,
         "max_attained_batch": max(batched_forwards, default=0),
@@ -601,8 +610,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-json", default=None)
     args = parser.parse_args(argv)
 
-    if args.fake and "serial-graph" in args.arms:
-        parser.error("--fake cannot run the serial-graph arm")
+    if args.fake and ("serial-graph" in args.arms or "quantized" in args.arms):
+        parser.error("--fake cannot run the serial-graph or quantized arms")
     if not args.fake and not args.model_path:
         parser.error("--model-path is required without --fake")
     if args.device is None:
@@ -616,9 +625,13 @@ def _resolve_frame_interval(ctx: ModelContext, args: argparse.Namespace) -> None
 
 
 def _combos(arm: str, args: argparse.Namespace) -> list[tuple[int | None, int | None]]:
-    if arm != "batched":
-        return [(None, None)]
-    return list(itertools.product(args.wait_ms, args.floor))
+    if arm == "batched":
+        return list(itertools.product(args.wait_ms, args.floor))
+    if arm == "quantized":
+        # Zero wait fires every due bucket immediately, so the floor never
+        # gates; batch size is whatever is already ready, capped by ceiling.
+        return [(0, 1)]
+    return [(None, None)]
 
 
 def _describe(record: dict[str, Any]) -> str:
@@ -682,18 +695,26 @@ def main(argv: list[str] | None = None) -> int:
 
     equivalence = None
     if args.compare_waveforms:
-        equivalence = run_equivalence(ctx, args, streams=max(args.streams))
-        worst = min(
-            (entry["snr_db"] for entry in equivalence["per_request"].values()),
-            default=None,
-        )
-        print(
-            f"equivalence: streams={equivalence['streams']}"
-            f" max_batch={equivalence['max_attained_batch']}"
-            f" worst_snr_db={worst}"
-            f" failures={len(equivalence['failures'])}",
-            flush=True,
-        )
+        candidate_arms = [
+            arm for arm in args.arms if arm in ("batched", "quantized")
+        ] or ["batched"]
+        equivalence = []
+        for candidate_arm in candidate_arms:
+            report = run_equivalence(
+                ctx, args, streams=max(args.streams), candidate_arm=candidate_arm
+            )
+            equivalence.append(report)
+            worst = min(
+                (entry["snr_db"] for entry in report["per_request"].values()),
+                default=None,
+            )
+            print(
+                f"equivalence[{candidate_arm}]: streams={report['streams']}"
+                f" max_batch={report['max_attained_batch']}"
+                f" worst_snr_db={worst}"
+                f" failures={len(report['failures'])}",
+                flush=True,
+            )
 
     if args.output_json:
         payload = {
@@ -715,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
     if invalid_runs:
         print(f"{invalid_runs} invalid run(s); not formal output", flush=True)
         return 1
-    if equivalence and equivalence["failures"]:
+    if equivalence and any(report["failures"] for report in equivalence):
         return 1
     return 0
 
