@@ -195,6 +195,12 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
             total_gpu_memory_fraction=args.graph_memory_fraction,
             graph_keys=graph_keys,
         )
+        if not graph_runner.enabled:
+            # A degraded arm would silently measure the wrong mechanism.
+            raise RuntimeError(
+                "code2wav graph build failed: "
+                f"{graph_runner.stats()['disable_reason']}"
+            )
     return ModelContext(
         model=model,
         device=args.device,
@@ -641,9 +647,17 @@ def _combos(arm: str, args: argparse.Namespace) -> list[tuple[int | None, int | 
     if arm == "batched":
         return list(itertools.product(args.wait_ms, args.floor))
     if arm == "quantized":
-        # Default (0, 1) fires every due bucket immediately; the sweep lists
-        # let the wait-vs-fire policy frontier be measured on the same arm.
-        return list(itertools.product(args.quantized_wait_ms, args.quantized_floor))
+        # The sweep lists measure the wait-vs-fire policy frontier. Zero wait
+        # and floor 1 each fire every due bucket immediately, so any combo
+        # containing either collapses to the (0, 1) baseline.
+        combos: list[tuple[int | None, int | None]] = []
+        for wait_ms, floor in itertools.product(
+            args.quantized_wait_ms, args.quantized_floor
+        ):
+            combo = (0, 1) if wait_ms == 0 or floor == 1 else (wait_ms, floor)
+            if combo not in combos:
+                combos.append(combo)
+        return combos
     return [(None, None)]
 
 
