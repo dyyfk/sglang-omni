@@ -11,7 +11,8 @@ across four arms:
 - ``serial-eager``: batching off, CUDA graph off (#1126's control)
 - ``serial-graph``: batching off, CUDA graph on (production default, #1101)
 - ``batched``: batching on, CUDA graph off (#1126's bounded-wait/floor policy)
-- ``quantized``: batching and CUDA graph both on — shape-quantized dispatch
+- ``quantized``: batching and CUDA graph both on — chunk-aligned dispatch
+  (the arm keeps its historical label for continuity with recorded JSONs)
   (perf/code2wav-adaptive-dispatch) with batched graph keys captured;
   ``--quantized-wait-ms`` x ``--quantized-floor`` sweeps the wait-vs-fire
   policy frontier (default 0/1 = fire every due bucket immediately)
@@ -177,7 +178,7 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
             Code2WavCudaGraphRunner,
         )
         from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
-            _quantized_batch_graph_keys,
+            _batched_graph_keys,
             _serial_threshold_graph_keys,
         )
 
@@ -185,7 +186,7 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
             args.stream_chunk_size, args.left_context_size
         )
         if "quantized" in args.arms:
-            graph_keys = graph_keys + _quantized_batch_graph_keys(
+            graph_keys = graph_keys + _batched_graph_keys(
                 args.stream_chunk_size, args.left_context_size, args.ceiling
             )
         graph_runner = Code2WavCudaGraphRunner.build(
