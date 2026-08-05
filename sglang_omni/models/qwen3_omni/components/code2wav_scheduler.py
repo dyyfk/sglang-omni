@@ -56,12 +56,12 @@ def _serial_threshold_graph_keys(
     )
 
 
-def _quantized_batch_graph_keys(
+def _batched_graph_keys(
     stream_chunk_size: int,
     left_context_size: int,
     batch_ceiling: int,
 ) -> tuple[GraphKey, ...]:
-    # Quantized dispatch decomposes every group into ``_DECOMPOSE_SIZES``
+    # Chunk-aligned dispatch decomposes every group into ``_DECOMPOSE_SIZES``
     # sub-batches over the same window shapes as serial decode, so batched
     # graphs reuse the serial frame set with larger batch sizes.
     sizes = tuple(size for size in _DECOMPOSE_SIZES if 1 < size <= batch_ceiling)
@@ -113,7 +113,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     """Streaming vocoder scheduler. Same inbox/outbox interface as OmniScheduler.
 
     With batching and the CUDA graph runner both enabled, dispatch is
-    shape-quantized: each step consumes exactly ``stream_chunk_size`` new
+    chunk-aligned: each step consumes exactly ``stream_chunk_size`` new
     frames (a backlog drains over repeated uniform steps), so every window
     stays inside the serial graph key set and every sub-batch shape stays
     inside the captured batched key set; groups replay CUDA graphs and fall
@@ -164,11 +164,11 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             self._stream_chunk_batch_max = self._batch_ceiling
 
     @property
-    def _quantized_dispatch(self) -> bool:
+    def _chunk_aligned_dispatch(self) -> bool:
         """True while batched graph replay is actually available.
 
         Reads the runner's live key set, so a build-time or runtime disable
-        stops the one-chunk-per-step quantization tax and the 8/4/2/1
+        stops the one-chunk-per-step cap and the 8/4/2/1
         decomposition with it; fail-closed for runners without the property.
         """
         return (
@@ -370,11 +370,11 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         return len(state.chunks) - state.emitted
 
     def _step_frames(self, state: Code2WavStreamState) -> int:
-        """New frames the next step consumes. Quantized dispatch caps each
+        """New frames the next step consumes. Chunk-aligned dispatch caps each
         step at one stream chunk so windows stay inside the serial graph key
         set and buckets stay comparable regardless of per-request backlog."""
         ready = self._ready(state)
-        if self._quantized_dispatch:
+        if self._chunk_aligned_dispatch:
             return min(ready, self._stream_chunk_size)
         return ready
 
@@ -452,7 +452,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def build_step_plan(
         self, participants: list[tuple[str, Code2WavStreamState]]
     ) -> list[int]:
-        if not self._quantized_dispatch:
+        if not self._chunk_aligned_dispatch:
             return [len(participants)]
         return self._decompose_batch(len(participants))
 
@@ -517,7 +517,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             codes = torch.stack(rows, dim=0)
             wav, execution_metadata = self._forward_codes(
                 codes,
-                graph_eligible=self._quantized_dispatch,
+                graph_eligible=self._chunk_aligned_dispatch,
             )
             if profile_metadata is not None:
                 sub_batch_execution.append(
@@ -606,7 +606,7 @@ def create_code2wav_scheduler(
         )
         graph_keys = serial_keys
         if enable_batching:
-            graph_keys = graph_keys + _quantized_batch_graph_keys(
+            graph_keys = graph_keys + _batched_graph_keys(
                 stream_chunk_size,
                 left_context_size,
                 batch_ceiling,

@@ -16,7 +16,7 @@ from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
     Code2WavStreamState,
-    _quantized_batch_graph_keys,
+    _batched_graph_keys,
     _serial_threshold_graph_keys,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
@@ -61,11 +61,11 @@ def _make_batching_scheduler(**kwargs) -> Code2WavScheduler:
     )
 
 
-def _make_quantized_scheduler(**kwargs) -> Code2WavScheduler:
+def _make_chunk_aligned_scheduler(**kwargs) -> Code2WavScheduler:
     model = FakeCode2WavModel(total_upsample=2)
     runner = _FakeGraphRunner(
         model,
-        _serial_threshold_graph_keys(2, 1) + _quantized_batch_graph_keys(2, 1, 8),
+        _serial_threshold_graph_keys(2, 1) + _batched_graph_keys(2, 1, 8),
     )
     return Code2WavScheduler(
         model,
@@ -504,21 +504,21 @@ def test_batch_events_emitted(monkeypatch) -> None:
 
 
 def test_batching_and_cuda_graph_coexist() -> None:
-    scheduler = _make_quantized_scheduler()
-    assert scheduler._quantized_dispatch is True
+    scheduler = _make_chunk_aligned_scheduler()
+    assert scheduler._chunk_aligned_dispatch is True
     assert scheduler._cuda_graph_runner is not None
     legacy = _make_batching_scheduler()
-    assert legacy._quantized_dispatch is False
+    assert legacy._chunk_aligned_dispatch is False
 
 
-def test_quantized_step_plan_decomposes() -> None:
-    scheduler = _make_quantized_scheduler()
+def test_chunk_aligned_step_plan_decomposes() -> None:
+    scheduler = _make_chunk_aligned_scheduler()
     participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
     assert scheduler.build_step_plan(participants) == [4, 2, 1]
 
 
-def test_quantized_backlog_drains_in_uniform_graph_windows() -> None:
-    scheduler = _make_quantized_scheduler(max_batch_wait_ms=0, batch_floor=2)
+def test_chunk_aligned_backlog_drains_in_uniform_graph_windows() -> None:
+    scheduler = _make_chunk_aligned_scheduler(max_batch_wait_ms=0, batch_floor=2)
     _feed_batch(scheduler, [("req-1", code) for code in (1, 2, 3, 4, 5, 6)])
     assert scheduler._model.calls == [(1, 2, 2), (1, 2, 3), (1, 2, 3)]
     assert scheduler._stream_states["req-1"].emitted == 6
@@ -526,8 +526,8 @@ def test_quantized_backlog_drains_in_uniform_graph_windows() -> None:
     assert [mode for _, _, mode in runner.calls] == ["cuda_graph"] * 3
 
 
-def test_quantized_buckets_merge_mixed_backlogs() -> None:
-    scheduler = _make_quantized_scheduler(max_batch_wait_ms=0, batch_floor=2)
+def test_chunk_aligned_buckets_merge_mixed_backlogs() -> None:
+    scheduler = _make_chunk_aligned_scheduler(max_batch_wait_ms=0, batch_floor=2)
     _feed_batch(scheduler, [("req-a", 1), ("req-a", 2)])
     _feed_batch(scheduler, [("req-b", 3), ("req-b", 4)])
     _drain_outbox(scheduler)
@@ -543,7 +543,7 @@ def test_quantized_buckets_merge_mixed_backlogs() -> None:
         ],
     )
     # Legacy buckets isolate ready=2 from ready=4 (see test_bucket_isolation);
-    # quantized buckets collapse to (context, context+chunk) and merge them.
+    # chunk-aligned buckets collapse to (context, context+chunk) and merge them.
     assert scheduler._model.calls[2:] == [(2, 2, 3), (1, 2, 3)]
     assert scheduler._stream_states["req-a"].emitted == 4
     assert scheduler._stream_states["req-b"].emitted == 6
@@ -554,14 +554,14 @@ def test_quantized_buckets_merge_mixed_backlogs() -> None:
     ]
 
 
-def test_quantized_batch_graph_keys_cover_decompose_sizes() -> None:
-    keys = _quantized_batch_graph_keys(2, 1, 8)
+def test_batched_graph_keys_cover_decompose_sizes() -> None:
+    keys = _batched_graph_keys(2, 1, 8)
     assert set(keys) == {
         GraphKey(batch_size=size, frames=frames)
         for size in (2, 4, 8)
         for frames in (2, 3)
     }
-    capped = _quantized_batch_graph_keys(2, 1, 4)
+    capped = _batched_graph_keys(2, 1, 4)
     assert {key.batch_size for key in capped} == {2, 4}
 
 
@@ -598,10 +598,10 @@ def test_factory_builds_batched_keys_with_batching(monkeypatch) -> None:
     assert GraphKey(batch_size=2, frames=3) in keys
     assert GraphKey(batch_size=4, frames=2) in keys
     assert all(key.batch_size <= 4 for key in keys)
-    assert scheduler._quantized_dispatch is True
+    assert scheduler._chunk_aligned_dispatch is True
 
 
-def test_serial_only_runner_disables_quantized_dispatch() -> None:
+def test_serial_only_runner_disables_chunk_aligned_dispatch() -> None:
     model = FakeCode2WavModel(total_upsample=2)
     runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
     scheduler = Code2WavScheduler(
@@ -614,18 +614,18 @@ def test_serial_only_runner_disables_quantized_dispatch() -> None:
         enable_cuda_graph=True,
         _cuda_graph_runner=runner,
     )
-    # Without batched graphs there is no reason to pay the quantization
-    # tax: no one-chunk step cap and no 8/4/2/1 decomposition.
-    assert scheduler._quantized_dispatch is False
+    # Without batched graphs there is no reason to pay the chunk-alignment
+    # cost: no one-chunk step cap and no 8/4/2/1 decomposition.
+    assert scheduler._chunk_aligned_dispatch is False
     participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
     assert scheduler.build_step_plan(participants) == [7]
 
 
-def test_runtime_disable_stops_quantized_dispatch() -> None:
-    scheduler = _make_quantized_scheduler()
-    assert scheduler._quantized_dispatch is True
+def test_runtime_disable_stops_chunk_aligned_dispatch() -> None:
+    scheduler = _make_chunk_aligned_scheduler()
+    assert scheduler._chunk_aligned_dispatch is True
     scheduler._cuda_graph_runner.max_captured_batch_size = 0
-    assert scheduler._quantized_dispatch is False
+    assert scheduler._chunk_aligned_dispatch is False
     participants = [(f"r{i}", Code2WavStreamState()) for i in range(3)]
     assert scheduler.build_step_plan(participants) == [3]
 
@@ -666,11 +666,11 @@ def test_factory_retries_serial_keys_when_batched_build_fails(monkeypatch) -> No
     # Every batching mode without batched graphs measured worse than plain
     # serial graph replay, so the factory drops batching with the capture.
     assert scheduler._enable_batching is False
-    assert scheduler._quantized_dispatch is False
+    assert scheduler._chunk_aligned_dispatch is False
 
 
-def test_quantized_groups_replay_batched_graphs() -> None:
-    scheduler = _make_quantized_scheduler(max_batch_wait_ms=0, batch_floor=2)
+def test_chunk_aligned_groups_replay_batched_graphs() -> None:
+    scheduler = _make_chunk_aligned_scheduler(max_batch_wait_ms=0, batch_floor=2)
     _feed_batch(
         scheduler,
         [(rid, code) for rid in ("req-a", "req-b") for code in (1, 2, 3, 4)],
@@ -681,12 +681,12 @@ def test_quantized_groups_replay_batched_graphs() -> None:
     assert all(mode == "cuda_graph" for _, _, mode in batched_calls)
 
 
-def test_quantized_group_key_miss_falls_back_eager() -> None:
+def test_chunk_aligned_group_key_miss_falls_back_eager() -> None:
     model = FakeCode2WavModel(total_upsample=2)
     # Batched graphs exist only for size 2; a size-4 sub-batch is a key miss.
     runner = _FakeGraphRunner(
         model,
-        _serial_threshold_graph_keys(2, 1) + _quantized_batch_graph_keys(2, 1, 2),
+        _serial_threshold_graph_keys(2, 1) + _batched_graph_keys(2, 1, 2),
     )
     scheduler = Code2WavScheduler(
         model,
@@ -712,7 +712,7 @@ def test_quantized_group_key_miss_falls_back_eager() -> None:
         assert scheduler._stream_states[rid].emitted == 2
 
 
-def test_quantized_waveforms_match_serial_reference() -> None:
+def test_chunk_aligned_waveforms_match_serial_reference() -> None:
     schedule = {
         "req-1": [1, 2, 3, 4, 5, 6],
         "req-2": [7, 8, 9, 10, 11, 12],
@@ -729,7 +729,7 @@ def test_quantized_waveforms_match_serial_reference() -> None:
         for code in codes:
             control._handle_stream_chunk(rid, _stream_item(code))
 
-    quantized = _make_quantized_scheduler(max_batch_wait_ms=0, batch_floor=2)
+    quantized = _make_chunk_aligned_scheduler(max_batch_wait_ms=0, batch_floor=2)
     _feed_batch(
         quantized,
         [(rid, code) for rid, codes in schedule.items() for code in codes],
