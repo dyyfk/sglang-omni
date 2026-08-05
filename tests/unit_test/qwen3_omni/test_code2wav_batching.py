@@ -28,6 +28,7 @@ class _FakeGraphRunner:
     def __init__(self, model, keys) -> None:
         self._model = model
         self._keys = set(keys)
+        self.enabled = True
         self.calls: list[tuple[tuple[int, ...], bool, str]] = []
 
     def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
@@ -489,6 +490,14 @@ def test_batch_events_emitted(monkeypatch) -> None:
     assert start_meta["due_bucket_count"] == 1
     assert end_meta["audio_samples"] > 0
     assert end_meta["execution_mode"] == "eager"
+    assert end_meta["sub_batch_execution"] == [
+        {
+            "batch_size": 2,
+            "execution_mode": "eager",
+            "graph_key": None,
+            "fallback_reason": None,
+        }
+    ]
 
 
 def test_batching_and_cuda_graph_coexist() -> None:
@@ -586,6 +595,59 @@ def test_factory_builds_batched_keys_with_batching(monkeypatch) -> None:
     assert GraphKey(batch_size=2, frames=3) in keys
     assert GraphKey(batch_size=4, frames=2) in keys
     assert all(key.batch_size <= 4 for key in keys)
+    assert scheduler._quantized_dispatch is True
+
+
+def test_quantized_dispatch_requires_enabled_runner() -> None:
+    model = FakeCode2WavModel(total_upsample=2)
+    runner = _FakeGraphRunner(model, ())
+    runner.enabled = False
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        sample_rate=24000,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        _cuda_graph_runner=runner,
+    )
+    assert scheduler._quantized_dispatch is False
+
+
+def test_factory_retries_serial_keys_when_batched_build_fails(monkeypatch) -> None:
+    import sglang_omni.models.qwen3_omni.components.code2wav_scheduler as mod
+
+    def _fake_load(path, *, device, dtype):
+        model = FakeCode2WavModel(total_upsample=2)
+        model.config = SimpleNamespace(num_quantizers=2)
+        return model
+
+    monkeypatch.setattr(mod, "load_code2wav_model", _fake_load)
+    built_keys: list[tuple] = []
+
+    class _FakeRunnerCls:
+        @classmethod
+        def build(cls, model, **kwargs):
+            built_keys.append(tuple(kwargs["graph_keys"]))
+            runner = _FakeGraphRunner(model, kwargs["graph_keys"])
+            runner.enabled = len(built_keys) > 1
+            runner.stats = lambda: {"disable_reason": "memory_budget_exceeded"}
+            return runner
+
+    monkeypatch.setattr(mod, "Code2WavCudaGraphRunner", _FakeRunnerCls)
+    scheduler = mod.create_code2wav_scheduler(
+        "fake-path",
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        total_gpu_memory_fraction=0.05,
+    )
+    assert len(built_keys) == 2
+    assert built_keys[1] == _serial_threshold_graph_keys(2, 1)
+    assert all(key.batch_size == 1 for key in built_keys[1])
     assert scheduler._quantized_dispatch is True
 
 

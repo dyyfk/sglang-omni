@@ -496,6 +496,10 @@ class Code2WavCudaGraphRunner:
             )
         logger.exception("Code2Wav CUDA graph replay disabled the runner")
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
     def stats(self) -> dict[str, Any]:
         """Return a strict JSON-safe snapshot of build and runtime state."""
 
