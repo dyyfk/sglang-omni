@@ -500,6 +500,11 @@ class Code2WavCudaGraphRunner:
     def enabled(self) -> bool:
         return self._enabled
 
+    @property
+    def max_captured_batch_size(self) -> int:
+        """Largest published batch dimension; 0 once the runner is disabled."""
+        return max((key.batch_size for key in self._graphs), default=0)
+
     def stats(self) -> dict[str, Any]:
         """Return a strict JSON-safe snapshot of build and runtime state."""
 
