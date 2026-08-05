@@ -29,6 +29,9 @@ class _FakeGraphRunner:
         self._model = model
         self._keys = set(keys)
         self.enabled = True
+        self.max_captured_batch_size = max(
+            (key.batch_size for key in self._keys), default=0
+        )
         self.calls: list[tuple[tuple[int, ...], bool, str]] = []
 
     def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
@@ -598,10 +601,9 @@ def test_factory_builds_batched_keys_with_batching(monkeypatch) -> None:
     assert scheduler._quantized_dispatch is True
 
 
-def test_quantized_dispatch_requires_enabled_runner() -> None:
+def test_serial_only_runner_disables_quantized_dispatch() -> None:
     model = FakeCode2WavModel(total_upsample=2)
-    runner = _FakeGraphRunner(model, ())
-    runner.enabled = False
+    runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
     scheduler = Code2WavScheduler(
         model,
         device="cpu",
@@ -612,7 +614,20 @@ def test_quantized_dispatch_requires_enabled_runner() -> None:
         enable_cuda_graph=True,
         _cuda_graph_runner=runner,
     )
+    # Without batched graphs there is no reason to pay the quantization
+    # tax: no one-chunk step cap and no 8/4/2/1 decomposition.
     assert scheduler._quantized_dispatch is False
+    participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
+    assert scheduler.build_step_plan(participants) == [7]
+
+
+def test_runtime_disable_stops_quantized_dispatch() -> None:
+    scheduler = _make_quantized_scheduler()
+    assert scheduler._quantized_dispatch is True
+    scheduler._cuda_graph_runner.max_captured_batch_size = 0
+    assert scheduler._quantized_dispatch is False
+    participants = [(f"r{i}", Code2WavStreamState()) for i in range(3)]
+    assert scheduler.build_step_plan(participants) == [3]
 
 
 def test_factory_retries_serial_keys_when_batched_build_fails(monkeypatch) -> None:
@@ -648,7 +663,10 @@ def test_factory_retries_serial_keys_when_batched_build_fails(monkeypatch) -> No
     assert len(built_keys) == 2
     assert built_keys[1] == _serial_threshold_graph_keys(2, 1)
     assert all(key.batch_size == 1 for key in built_keys[1])
-    assert scheduler._quantized_dispatch is True
+    # Every batching mode without batched graphs measured worse than plain
+    # serial graph replay, so the factory drops batching with the capture.
+    assert scheduler._enable_batching is False
+    assert scheduler._quantized_dispatch is False
 
 
 def test_quantized_groups_replay_batched_graphs() -> None:
@@ -665,7 +683,11 @@ def test_quantized_groups_replay_batched_graphs() -> None:
 
 def test_quantized_group_key_miss_falls_back_eager() -> None:
     model = FakeCode2WavModel(total_upsample=2)
-    runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
+    # Batched graphs exist only for size 2; a size-4 sub-batch is a key miss.
+    runner = _FakeGraphRunner(
+        model,
+        _serial_threshold_graph_keys(2, 1) + _quantized_batch_graph_keys(2, 1, 2),
+    )
     scheduler = Code2WavScheduler(
         model,
         device="cpu",
@@ -678,17 +700,16 @@ def test_quantized_group_key_miss_falls_back_eager() -> None:
         enable_cuda_graph=True,
         _cuda_graph_runner=runner,
     )
+    rids = [f"req-{i}" for i in range(4)]
     _feed_batch(
         scheduler,
-        [(rid, code) for rid in ("req-a", "req-b") for code in (1, 2, 3, 4)],
+        [(rid, code) for rid in rids for code in (1, 2)],
     )
-    batched_calls = [call for call in runner.calls if call[0][0] > 1]
-    assert batched_calls
-    assert all(
-        (eligible, mode) == (True, "eager") for _, eligible, mode in batched_calls
-    )
-    assert scheduler._stream_states["req-a"].emitted == 4
-    assert scheduler._stream_states["req-b"].emitted == 4
+    miss_calls = [call for call in runner.calls if call[0][0] == 4]
+    assert miss_calls
+    assert all((eligible, mode) == (True, "eager") for _, eligible, mode in miss_calls)
+    for rid in rids:
+        assert scheduler._stream_states[rid].emitted == 2
 
 
 def test_quantized_waveforms_match_serial_reference() -> None:

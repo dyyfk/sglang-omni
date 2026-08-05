@@ -6,6 +6,7 @@ runs vocoder incrementally, outputs final audio via outbox.
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import queue
@@ -161,12 +162,18 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self._can_batch_stream_chunks = self._enable_batching
         if self._enable_batching:
             self._stream_chunk_batch_max = self._batch_ceiling
-        # A runner that failed its build only ever answers eager; don't pay the
-        # one-chunk-per-step quantization tax without the graph benefit.
-        self._quantized_dispatch = (
+
+    @property
+    def _quantized_dispatch(self) -> bool:
+        """True while batched graph replay is actually available.
+
+        Reads the runner's live key set, so a build-time or runtime disable
+        stops the one-chunk-per-step quantization tax and the 8/4/2/1
+        decomposition with it; fail-closed for runners without the property.
+        """
+        return (
             self._enable_batching
-            and self._cuda_graph_runner is not None
-            and bool(getattr(self._cuda_graph_runner, "enabled", True))
+            and getattr(self._cuda_graph_runner, "max_captured_batch_size", 0) > 1
         )
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
@@ -445,7 +452,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def build_step_plan(
         self, participants: list[tuple[str, Code2WavStreamState]]
     ) -> list[int]:
-        if self._cuda_graph_runner is None:
+        if not self._quantized_dispatch:
             return [len(participants)]
         return self._decompose_batch(len(participants))
 
@@ -613,12 +620,16 @@ def create_code2wav_scheduler(
         )
         if len(graph_keys) > len(serial_keys) and not cuda_graph_runner.enabled:
             # The runner build is all-or-nothing; don't let a failed batched
-            # capture take the serial graphs down with it.
+            # capture take the serial graphs down with it. Measured on H100:
+            # every batching mode without batched graphs loses to plain
+            # serial graph replay, so drop batching with the failed capture.
             logger.warning(
-                "Code2Wav batched graph build failed (%s); retrying with "
-                "serial-only keys",
+                "Code2Wav batched graph build failed (%s); disabling batching "
+                "and retrying with serial-only keys",
                 cuda_graph_runner.stats()["disable_reason"],
             )
+            cuda_graph_runner = None
+            gc.collect()
             cuda_graph_runner = Code2WavCudaGraphRunner.build(
                 model,
                 device=concrete_device,
@@ -626,6 +637,7 @@ def create_code2wav_scheduler(
                 total_gpu_memory_fraction=total_gpu_memory_fraction,
                 graph_keys=serial_keys,
             )
+            enable_batching = False
         logger.info(
             "Code2Wav CUDA graph startup stats=%s",
             json.dumps(
