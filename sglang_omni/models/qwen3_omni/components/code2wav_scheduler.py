@@ -50,6 +50,22 @@ def _serial_threshold_graph_keys(
     )
 
 
+def _quantized_batch_graph_keys(
+    stream_chunk_size: int,
+    left_context_size: int,
+    batch_ceiling: int,
+) -> tuple[GraphKey, ...]:
+    # Quantized dispatch decomposes every group into sub-batches of 8/4/2/1
+    # over the same window shapes as serial decode, so batched graphs reuse
+    # the serial frame set with larger batch sizes.
+    sizes = tuple(size for size in (2, 4, 8) if size <= batch_ceiling)
+    return tuple(
+        GraphKey(batch_size=size, frames=key.frames)
+        for size in sizes
+        for key in _serial_threshold_graph_keys(stream_chunk_size, left_context_size)
+    )
+
+
 def load_code2wav_model(
     model_path: str, *, device: str = "cuda", dtype: str | None = None
 ):
@@ -93,8 +109,9 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     With batching and the CUDA graph runner both enabled, dispatch is
     shape-quantized: each step consumes exactly ``stream_chunk_size`` new
     frames (a backlog drains over repeated uniform steps), so every window
-    stays inside the serial graph key set and size-1 dispatches replay the
-    serial CUDA graph while multi-request groups run one eager forward.
+    stays inside the serial graph key set and every sub-batch shape stays
+    inside the captured batched key set; groups replay CUDA graphs and fall
+    back to one eager forward on a key miss.
     """
 
     def __init__(
@@ -483,7 +500,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             codes = torch.stack(rows, dim=0)
             wav, execution_metadata = self._forward_codes(
                 codes,
-                graph_eligible=self._quantized_dispatch and len(group) == 1,
+                graph_eligible=self._quantized_dispatch,
             )
             if wav.shape[0] != len(group):
                 raise RuntimeError(
@@ -559,15 +576,22 @@ def create_code2wav_scheduler(
     model = load_code2wav_model(model_path, device=device, dtype=dtype)
     cuda_graph_runner = None
     if enable_cuda_graph:
+        graph_keys = _serial_threshold_graph_keys(
+            stream_chunk_size,
+            left_context_size,
+        )
+        if enable_batching:
+            graph_keys = graph_keys + _quantized_batch_graph_keys(
+                stream_chunk_size,
+                left_context_size,
+                batch_ceiling,
+            )
         cuda_graph_runner = Code2WavCudaGraphRunner.build(
             model,
             device=concrete_device,
             num_quantizers=int(model.config.num_quantizers),
             total_gpu_memory_fraction=total_gpu_memory_fraction,
-            graph_keys=_serial_threshold_graph_keys(
-                stream_chunk_size,
-                left_context_size,
-            ),
+            graph_keys=graph_keys,
         )
         logger.info(
             "Code2Wav CUDA graph startup stats=%s",
