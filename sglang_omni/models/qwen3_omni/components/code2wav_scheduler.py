@@ -31,6 +31,11 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 
+# Sub-batch sizes emitted by ``Code2WavScheduler._decompose_batch``; the
+# batched graph key set and the batch-ceiling clamp must stay in sync with it.
+_DECOMPOSE_SIZES = (8, 4, 2, 1)
+
+
 def _serial_threshold_graph_keys(
     stream_chunk_size: int,
     left_context_size: int,
@@ -55,10 +60,10 @@ def _quantized_batch_graph_keys(
     left_context_size: int,
     batch_ceiling: int,
 ) -> tuple[GraphKey, ...]:
-    # Quantized dispatch decomposes every group into sub-batches of 8/4/2/1
-    # over the same window shapes as serial decode, so batched graphs reuse
-    # the serial frame set with larger batch sizes.
-    sizes = tuple(size for size in (2, 4, 8) if size <= batch_ceiling)
+    # Quantized dispatch decomposes every group into ``_DECOMPOSE_SIZES``
+    # sub-batches over the same window shapes as serial decode, so batched
+    # graphs reuse the serial frame set with larger batch sizes.
+    sizes = tuple(size for size in _DECOMPOSE_SIZES if 1 < size <= batch_ceiling)
     return tuple(
         GraphKey(batch_size=size, frames=key.frames)
         for size in sizes
@@ -148,7 +153,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self._enable_batching = bool(enable_batching)
         self._max_batch_wait_s = max(int(max_batch_wait_ms), 0) / 1000.0
         self._batch_floor = max(int(batch_floor), 1)
-        self._batch_ceiling = min(max(int(batch_ceiling), 1), 8)
+        self._batch_ceiling = min(max(int(batch_ceiling), 1), _DECOMPOSE_SIZES[0])
         self._drain_mode = False
         self._last_fire_reason: str | None = None
         self._last_oldest_wait_ms: float = 0.0
@@ -156,8 +161,12 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self._can_batch_stream_chunks = self._enable_batching
         if self._enable_batching:
             self._stream_chunk_batch_max = self._batch_ceiling
+        # A runner that failed its build only ever answers eager; don't pay the
+        # one-chunk-per-step quantization tax without the graph benefit.
         self._quantized_dispatch = (
-            self._enable_batching and self._cuda_graph_runner is not None
+            self._enable_batching
+            and self._cuda_graph_runner is not None
+            and bool(getattr(self._cuda_graph_runner, "enabled", True))
         )
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
@@ -369,7 +378,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     @staticmethod
     def _decompose_batch(n: int) -> list[int]:
         plan: list[int] = []
-        for size in (8, 4, 2, 1):
+        for size in _DECOMPOSE_SIZES:
             while n >= size:
                 plan.append(size)
                 n -= size
@@ -473,6 +482,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             "graph_key": None,
             "fallback_reason": None,
         }
+        sub_batch_execution: list[dict[str, Any]] = []
         audio_samples = 0
         cursor = 0
         for sub in plan:
@@ -502,6 +512,10 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 codes,
                 graph_eligible=self._quantized_dispatch,
             )
+            if profile_metadata is not None:
+                sub_batch_execution.append(
+                    {"batch_size": len(group), **execution_metadata}
+                )
             if wav.shape[0] != len(group):
                 raise RuntimeError(
                     f"code2wav step returned {wav.shape[0]} rows for "
@@ -538,7 +552,10 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 metadata={
                     **profile_metadata,
                     "audio_samples": audio_samples,
+                    # Last sub-batch, kept for event-shape compatibility; the
+                    # per-sub-batch list is the authoritative record.
                     **execution_metadata,
+                    "sub_batch_execution": sub_batch_execution,
                 },
             )
         return decoded
@@ -576,10 +593,11 @@ def create_code2wav_scheduler(
     model = load_code2wav_model(model_path, device=device, dtype=dtype)
     cuda_graph_runner = None
     if enable_cuda_graph:
-        graph_keys = _serial_threshold_graph_keys(
+        serial_keys = _serial_threshold_graph_keys(
             stream_chunk_size,
             left_context_size,
         )
+        graph_keys = serial_keys
         if enable_batching:
             graph_keys = graph_keys + _quantized_batch_graph_keys(
                 stream_chunk_size,
@@ -593,6 +611,21 @@ def create_code2wav_scheduler(
             total_gpu_memory_fraction=total_gpu_memory_fraction,
             graph_keys=graph_keys,
         )
+        if len(graph_keys) > len(serial_keys) and not cuda_graph_runner.enabled:
+            # The runner build is all-or-nothing; don't let a failed batched
+            # capture take the serial graphs down with it.
+            logger.warning(
+                "Code2Wav batched graph build failed (%s); retrying with "
+                "serial-only keys",
+                cuda_graph_runner.stats()["disable_reason"],
+            )
+            cuda_graph_runner = Code2WavCudaGraphRunner.build(
+                model,
+                device=concrete_device,
+                num_quantizers=int(model.config.num_quantizers),
+                total_gpu_memory_fraction=total_gpu_memory_fraction,
+                graph_keys=serial_keys,
+            )
         logger.info(
             "Code2Wav CUDA graph startup stats=%s",
             json.dumps(
