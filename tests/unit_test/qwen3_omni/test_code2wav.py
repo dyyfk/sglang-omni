@@ -165,7 +165,9 @@ def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
     monkeypatch,
 ) -> None:
     model = _FactoryModel(num_quantizers=12)
-    runner = SimpleNamespace(stats=lambda: {"enabled": True, "disable_reason": None})
+    runner = SimpleNamespace(
+        enabled=True, stats=lambda: {"enabled": True, "disable_reason": None}
+    )
     monkeypatch.setattr(
         code2wav_scheduler, "load_code2wav_model", lambda *a, **k: model.eval()
     )
