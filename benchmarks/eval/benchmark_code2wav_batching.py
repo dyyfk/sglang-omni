@@ -11,9 +11,10 @@ across four arms:
 - ``serial-eager``: batching off, CUDA graph off (#1126's control)
 - ``serial-graph``: batching off, CUDA graph on (production default, #1101)
 - ``batched``: batching on, CUDA graph off (#1126's bounded-wait/floor policy)
-- ``quantized``: batching and CUDA graph both on — shape-quantized zero-wait
-  dispatch (perf/code2wav-adaptive-dispatch); wait/floor pinned to 0/1 since
-  zero wait fires every due bucket immediately
+- ``quantized``: batching and CUDA graph both on — shape-quantized dispatch
+  (perf/code2wav-adaptive-dispatch) with batched graph keys captured;
+  ``--quantized-wait-ms`` x ``--quantized-floor`` sweeps the wait-vs-fire
+  policy frontier (default 0/1 = fire every due bucket immediately)
 
 Arrival modes:
 
@@ -176,17 +177,23 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
             Code2WavCudaGraphRunner,
         )
         from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
+            _quantized_batch_graph_keys,
             _serial_threshold_graph_keys,
         )
 
+        graph_keys = _serial_threshold_graph_keys(
+            args.stream_chunk_size, args.left_context_size
+        )
+        if "quantized" in args.arms:
+            graph_keys = graph_keys + _quantized_batch_graph_keys(
+                args.stream_chunk_size, args.left_context_size, args.ceiling
+            )
         graph_runner = Code2WavCudaGraphRunner.build(
             model,
             device=torch.device(args.device),
             num_quantizers=int(model.config.num_quantizers),
             total_gpu_memory_fraction=args.graph_memory_fraction,
-            graph_keys=_serial_threshold_graph_keys(
-                args.stream_chunk_size, args.left_context_size
-            ),
+            graph_keys=graph_keys,
         )
     return ModelContext(
         model=model,
@@ -600,6 +607,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--code-vocab", type=int, default=2048, help="codes drawn from [0, vocab)"
     )
+    parser.add_argument(
+        "--quantized-wait-ms", type=lambda raw: _parse_csv(raw, int), default=[0]
+    )
+    parser.add_argument(
+        "--quantized-floor", type=lambda raw: _parse_csv(raw, int), default=[1]
+    )
     parser.add_argument("--graph-memory-fraction", type=float, default=0.02)
     parser.add_argument("--timeout-s", type=float, default=300.0)
     parser.add_argument("--compare-waveforms", action="store_true")
@@ -628,9 +641,9 @@ def _combos(arm: str, args: argparse.Namespace) -> list[tuple[int | None, int | 
     if arm == "batched":
         return list(itertools.product(args.wait_ms, args.floor))
     if arm == "quantized":
-        # Zero wait fires every due bucket immediately, so the floor never
-        # gates; batch size is whatever is already ready, capped by ceiling.
-        return [(0, 1)]
+        # Default (0, 1) fires every due bucket immediately; the sweep lists
+        # let the wait-vs-fire policy frontier be measured on the same arm.
+        return list(itertools.product(args.quantized_wait_ms, args.quantized_floor))
     return [(None, None)]
 
 
@@ -716,6 +729,18 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
+    graph_runner_stats = None
+    if ctx.graph_runner is not None:
+        graph_runner_stats = ctx.graph_runner.stats()
+        runtime = graph_runner_stats["runtime"]
+        print(
+            f"graph_runner: enabled={graph_runner_stats['enabled']}"
+            f" graphs={graph_runner_stats['build']['published_graph_count']}"
+            f" replays={runtime['graph_replays']}"
+            f" fallbacks={runtime['fallback_counts']}",
+            flush=True,
+        )
+
     if args.output_json:
         payload = {
             "config": {
@@ -728,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             "runs": records,
             "equivalence": equivalence,
+            "graph_runner_stats": graph_runner_stats,
         }
         with open(args.output_json, "w") as handle:
             json.dump(payload, handle, indent=2)
