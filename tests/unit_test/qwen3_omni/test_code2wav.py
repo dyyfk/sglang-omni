@@ -189,7 +189,7 @@ def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
 
     assert scheduler._enable_batching is True
     assert scheduler._cuda_graph_runner is runner
-    assert scheduler._quantized_dispatch is True
+    assert scheduler._chunk_aligned_dispatch is True
 
 
 @pytest.mark.parametrize(
