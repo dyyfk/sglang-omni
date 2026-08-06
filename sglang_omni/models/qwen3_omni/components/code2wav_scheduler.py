@@ -32,8 +32,8 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 
-# Sub-batch sizes emitted by ``Code2WavScheduler._decompose_batch``; the
-# batched graph key set and the batch-ceiling clamp must stay in sync with it.
+# Note (ruoyu): the decomposition, the captured batched keys and the batch
+# ceiling all derive from this tuple so a captured key can never go missing.
 _DECOMPOSE_SIZES = (8, 4, 2, 1)
 
 
@@ -61,9 +61,8 @@ def _batched_graph_keys(
     left_context_size: int,
     batch_ceiling: int,
 ) -> tuple[GraphKey, ...]:
-    # Chunk-aligned dispatch decomposes every group into ``_DECOMPOSE_SIZES``
-    # sub-batches over the same window shapes as serial decode, so batched
-    # graphs reuse the serial frame set with larger batch sizes.
+    # Note (ruoyu): chunk-aligned sub-batches decode the same windows as serial
+    # decode, so the serial frame set is the complete batched frame set too.
     sizes = tuple(size for size in _DECOMPOSE_SIZES if 1 < size <= batch_ceiling)
     return tuple(
         GraphKey(batch_size=size, frames=key.frames)
@@ -110,15 +109,7 @@ class Code2WavStreamState:
 
 
 class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
-    """Streaming vocoder scheduler. Same inbox/outbox interface as OmniScheduler.
-
-    With batching and the CUDA graph runner both enabled, dispatch is
-    chunk-aligned: each step consumes exactly ``stream_chunk_size`` new
-    frames (a backlog drains over repeated uniform steps), so every window
-    stays inside the serial graph key set and every sub-batch shape stays
-    inside the captured batched key set; groups replay CUDA graphs and fall
-    back to one eager forward on a key miss.
-    """
+    """Streaming vocoder scheduler. Same inbox/outbox interface as OmniScheduler."""
 
     def __init__(
         self,
@@ -159,18 +150,15 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self._last_fire_reason: str | None = None
         self._last_oldest_wait_ms: float = 0.0
         self._last_due_bucket_count: int = 0
+        self._pending_step_failures: list[str] = []
         self._can_batch_stream_chunks = self._enable_batching
         if self._enable_batching:
             self._stream_chunk_batch_max = self._batch_ceiling
 
     @property
     def _chunk_aligned_dispatch(self) -> bool:
-        """True while batched graph replay is actually available.
-
-        Reads the runner's live key set, so a build-time or runtime disable
-        stops the one-chunk-per-step cap and the 8/4/2/1
-        decomposition with it; fail-closed for runners without the property.
-        """
+        """Chunk alignment only pays off when batched graphs are live, so it
+        follows the runner's current state rather than the startup flags."""
         return (
             self._enable_batching
             and getattr(self._cuda_graph_runner, "max_captured_batch_size", 0) > 1
@@ -366,13 +354,22 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         for request_id in failed:
             self._cleanup_aborted_request(request_id)
 
+    def _pump_streams(self) -> list[str]:
+        # Note (ruoyu): a step that fails partway aborts inside run_step instead
+        # of raising, so its request ids surface here — the caller still owes
+        # them the abort callback it runs off ``_state_lock``.
+        failed = super()._pump_streams()
+        if self._pending_step_failures:
+            failed = failed + self._pending_step_failures
+            self._pending_step_failures = []
+        return failed
+
     def _ready(self, state: Code2WavStreamState) -> int:
         return len(state.chunks) - state.emitted
 
     def _step_frames(self, state: Code2WavStreamState) -> int:
-        """New frames the next step consumes. Chunk-aligned dispatch caps each
-        step at one stream chunk so windows stay inside the serial graph key
-        set and buckets stay comparable regardless of per-request backlog."""
+        """New frames the next step consumes; capped at one chunk so a backlog
+        cannot push the window outside the captured key set."""
         ready = self._ready(state)
         if self._chunk_aligned_dispatch:
             return min(ready, self._stream_chunk_size)
@@ -494,63 +491,22 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         cursor = 0
         for sub in plan:
             group = participants[cursor : cursor + sub]
-            cursor += sub
-            rows = []
-            window_ends: list[int] = []
-            for _, state in group:
-                start = state.emitted
-                end = start + self._step_frames(state)
-                window_ends.append(end)
-                context = min(self._left_context_size, start)
-                rows.append(
-                    torch.stack(state.chunks[start - context : end], dim=0).transpose(
-                        0, 1
-                    )
+            try:
+                samples, execution_metadata = self._run_sub_batch(group, decoded)
+            except Exception as exc:
+                # Note (ruoyu): the sub-batches already decoded advanced their
+                # cursors, so aborting every participant would drop audio the
+                # client is owed; fail only the ones that did not decode.
+                self._pending_step_failures.extend(
+                    self.on_step_failure(participants[cursor:], exc)
                 )
-            window_frames = rows[0].shape[-1]
-            for row in rows[1:]:
-                if row.shape[-1] != window_frames:
-                    raise RuntimeError(
-                        f"code2wav bucket mismatch: window {row.shape[-1]} vs "
-                        f"{window_frames}"
-                    )
-            codes = torch.stack(rows, dim=0)
-            wav, execution_metadata = self._forward_codes(
-                codes,
-                graph_eligible=self._chunk_aligned_dispatch,
-            )
+                break
+            cursor += sub
+            audio_samples += samples
             if profile_metadata is not None:
                 sub_batch_execution.append(
                     {"batch_size": len(group), **execution_metadata}
                 )
-            if wav.shape[0] != len(group):
-                raise RuntimeError(
-                    f"code2wav step returned {wav.shape[0]} rows for "
-                    f"{len(group)} requests"
-                )
-            context = min(self._left_context_size, group[0][1].emitted)
-            trim = context * self._total_upsample
-            if trim:
-                wav = wav[..., trim:]
-            host = wav.detach().cpu().float()
-            for i, (rid, state) in enumerate(group):
-                audio = host[i].reshape(-1).numpy().copy()
-                state.emitted = window_ends[i]
-                state.due_since = None
-                if audio.size == 0:
-                    continue
-                if profile_metadata is not None:
-                    audio_samples += int(audio.size)
-                if not state.audio_parts:
-                    _emit_event(
-                        request_id=rid,
-                        stage=None,
-                        event_name="code2wav_first_audio",
-                        metadata={"samples": int(audio.shape[0])},
-                    )
-                state.audio_parts.append(audio)
-                if state.stream_enabled:
-                    decoded[rid] = torch.from_numpy(audio)
         if profile_metadata is not None:
             _emit_event(
                 request_id=participants[0][0],
@@ -559,13 +515,73 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 metadata={
                     **profile_metadata,
                     "audio_samples": audio_samples,
-                    # Last sub-batch, kept for event-shape compatibility; the
+                    # Note (ruoyu): flat last-sub-batch fields kept so existing
+                    # single-forward event consumers keep parsing; the
                     # per-sub-batch list is the authoritative record.
                     **execution_metadata,
                     "sub_batch_execution": sub_batch_execution,
                 },
             )
         return decoded
+
+    def _run_sub_batch(
+        self,
+        group: list[tuple[str, Code2WavStreamState]],
+        decoded: dict[str, torch.Tensor],
+    ) -> tuple[int, dict[str, Any]]:
+        """Decode one sub-batch and advance its participants; returns the audio
+        sample count and the execution metadata of the forward."""
+        rows = []
+        window_ends: list[int] = []
+        for _, state in group:
+            start = state.emitted
+            end = start + self._step_frames(state)
+            window_ends.append(end)
+            context = min(self._left_context_size, start)
+            rows.append(
+                torch.stack(state.chunks[start - context : end], dim=0).transpose(0, 1)
+            )
+        window_frames = rows[0].shape[-1]
+        for row in rows[1:]:
+            if row.shape[-1] != window_frames:
+                raise RuntimeError(
+                    f"code2wav bucket mismatch: window {row.shape[-1]} vs "
+                    f"{window_frames}"
+                )
+        codes = torch.stack(rows, dim=0)
+        wav, execution_metadata = self._forward_codes(
+            codes,
+            graph_eligible=self._chunk_aligned_dispatch,
+        )
+        if wav.shape[0] != len(group):
+            raise RuntimeError(
+                f"code2wav step returned {wav.shape[0]} rows for "
+                f"{len(group)} requests"
+            )
+        context = min(self._left_context_size, group[0][1].emitted)
+        trim = context * self._total_upsample
+        if trim:
+            wav = wav[..., trim:]
+        host = wav.detach().cpu().float()
+        audio_samples = 0
+        for i, (rid, state) in enumerate(group):
+            audio = host[i].reshape(-1).numpy().copy()
+            state.emitted = window_ends[i]
+            state.due_since = None
+            if audio.size == 0:
+                continue
+            audio_samples += int(audio.size)
+            if not state.audio_parts:
+                _emit_event(
+                    request_id=rid,
+                    stage=None,
+                    event_name="code2wav_first_audio",
+                    metadata={"samples": int(audio.shape[0])},
+                )
+            state.audio_parts.append(audio)
+            if state.stream_enabled:
+                decoded[rid] = torch.from_numpy(audio)
+        return audio_samples, execution_metadata
 
 
 def create_code2wav_scheduler(
@@ -619,10 +635,10 @@ def create_code2wav_scheduler(
             graph_keys=graph_keys,
         )
         if len(graph_keys) > len(serial_keys) and not cuda_graph_runner.enabled:
-            # The runner build is all-or-nothing; don't let a failed batched
-            # capture take the serial graphs down with it. Measured on H100:
-            # every batching mode without batched graphs loses to plain
-            # serial graph replay, so drop batching with the failed capture.
+            # Note (ruoyu): the build is all-or-nothing, so a failed batched
+            # capture would take the serial graphs down with it. Batching
+            # without batched graphs measured worse than serial replay on
+            # H100, so it is dropped along with the failed capture.
             logger.warning(
                 "Code2Wav batched graph build failed (%s); disabling batching "
                 "and retrying with serial-only keys",

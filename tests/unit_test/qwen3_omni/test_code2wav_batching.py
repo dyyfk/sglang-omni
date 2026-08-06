@@ -393,6 +393,51 @@ def test_step_failure_isolates_participants() -> None:
     assert scheduler._stream_states["req-c"].emitted == 2
 
 
+def test_step_failure_after_success_keeps_decoded_sub_batches() -> None:
+    scheduler = _make_chunk_aligned_scheduler(max_batch_wait_ms=0, batch_floor=2)
+    cleaned: list[str] = []
+    scheduler._cleanup_aborted_request = cleaned.append
+
+    real_forward = scheduler._forward_codes
+    forwards = 0
+
+    def _fail_on_second_sub_batch(codes, **kwargs):
+        nonlocal forwards
+        forwards += 1
+        if forwards == 2:
+            raise RuntimeError("boom")
+        return real_forward(codes, **kwargs)
+
+    scheduler._forward_codes = _fail_on_second_sub_batch
+    _feed_batch(
+        scheduler,
+        [(rid, code) for rid in ("req-a", "req-b", "req-c") for code in (1, 2)],
+    )
+
+    # Note (ruoyu): plan [2, 1] — the size-2 sub-batch decoded before the
+    # size-1 one failed, so its audio must survive the failure.
+    messages = _drain_outbox(scheduler)
+    assert [m.request_id for m in messages if m.type == "stream"] == [
+        "req-a",
+        "req-b",
+    ]
+    assert [m.request_id for m in messages if m.type == "error"] == ["req-c"]
+    for rid in ("req-a", "req-b"):
+        assert scheduler._stream_states[rid].emitted == 2
+        assert not scheduler._is_aborted(rid)
+    assert "req-c" not in scheduler._stream_states
+    assert scheduler._is_aborted("req-c")
+    assert cleaned == ["req-c"]
+    assert scheduler._pending_step_failures == []
+
+    scheduler._forward_codes = real_forward
+    _feed_batch(scheduler, [("req-a", 3), ("req-a", 4)])
+    assert [(m.type, m.request_id) for m in _drain_outbox(scheduler)] == [
+        ("stream", "req-a")
+    ]
+    assert scheduler._stream_states["req-a"].emitted == 4
+
+
 def test_one_participation_per_pump() -> None:
     scheduler = _make_batching_scheduler(max_batch_wait_ms=0, batch_floor=2)
     _feed_batch(scheduler, [("req-1", 1), ("req-1", 2)])
@@ -542,8 +587,9 @@ def test_chunk_aligned_buckets_merge_mixed_backlogs() -> None:
             ("req-b", 10),
         ],
     )
-    # Legacy buckets isolate ready=2 from ready=4 (see test_bucket_isolation);
-    # chunk-aligned buckets collapse to (context, context+chunk) and merge them.
+    # Note (ruoyu): legacy buckets isolate ready=2 from ready=4 (see
+    # test_bucket_isolation); chunk-aligned buckets collapse to
+    # (context, context+chunk) and merge them.
     assert scheduler._model.calls[2:] == [(2, 2, 3), (1, 2, 3)]
     assert scheduler._stream_states["req-a"].emitted == 4
     assert scheduler._stream_states["req-b"].emitted == 6
@@ -614,8 +660,8 @@ def test_serial_only_runner_disables_chunk_aligned_dispatch() -> None:
         enable_cuda_graph=True,
         _cuda_graph_runner=runner,
     )
-    # Without batched graphs there is no reason to pay the chunk-alignment
-    # cost: no one-chunk step cap and no 8/4/2/1 decomposition.
+    # Note (ruoyu): without batched graphs there is no reason to pay the
+    # chunk-alignment cost: no one-chunk step cap and no 8/4/2/1 decomposition.
     assert scheduler._chunk_aligned_dispatch is False
     participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
     assert scheduler.build_step_plan(participants) == [7]
@@ -663,7 +709,7 @@ def test_factory_retries_serial_keys_when_batched_build_fails(monkeypatch) -> No
     assert len(built_keys) == 2
     assert built_keys[1] == _serial_threshold_graph_keys(2, 1)
     assert all(key.batch_size == 1 for key in built_keys[1])
-    # Every batching mode without batched graphs measured worse than plain
+    # Note (ruoyu): batching without batched graphs measured worse than plain
     # serial graph replay, so the factory drops batching with the capture.
     assert scheduler._enable_batching is False
     assert scheduler._chunk_aligned_dispatch is False
@@ -683,7 +729,8 @@ def test_chunk_aligned_groups_replay_batched_graphs() -> None:
 
 def test_chunk_aligned_group_key_miss_falls_back_eager() -> None:
     model = FakeCode2WavModel(total_upsample=2)
-    # Batched graphs exist only for size 2; a size-4 sub-batch is a key miss.
+    # Note (ruoyu): batched graphs exist only for size 2, so a size-4
+    # sub-batch must miss and fall back instead of failing the step.
     runner = _FakeGraphRunner(
         model,
         _serial_threshold_graph_keys(2, 1) + _batched_graph_keys(2, 1, 2),

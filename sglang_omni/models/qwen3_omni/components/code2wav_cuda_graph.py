@@ -168,6 +168,7 @@ class Code2WavCudaGraphRunner:
         self._owner_pid = os.getpid()
         self._cuda = cuda_api
         self._graphs: dict[GraphKey, _CapturedGraph] = {}
+        self._max_captured_batch_size = 0
         self._pool: Any | None = None
         self._capture_stream: Any | None = None
         self._enabled = False
@@ -285,6 +286,9 @@ class Code2WavCudaGraphRunner:
         self._pool = pool
         self._capture_stream = capture_stream
         self._graphs = {key: temporary[key] for key in self._graph_keys}
+        self._max_captured_batch_size = max(
+            (key.batch_size for key in self._graphs), default=0
+        )
         self._build_stats["published_graph_count"] = len(self._graphs)
         self._enabled = True
         logger.info(
@@ -378,6 +382,7 @@ class Code2WavCudaGraphRunner:
                     snapshot_exc,
                 )
         self._graphs.clear()
+        self._max_captured_batch_size = 0
         temporary.clear()
         self._pool = None
         self._capture_stream = None
@@ -481,6 +486,7 @@ class Code2WavCudaGraphRunner:
 
     def _disable_runtime(self, reason: str) -> None:
         self._graphs.clear()
+        self._max_captured_batch_size = 0
         self._pool = None
         self._capture_stream = None
         self._enabled = False
@@ -502,8 +508,11 @@ class Code2WavCudaGraphRunner:
 
     @property
     def max_captured_batch_size(self) -> int:
-        """Largest published batch dimension; 0 once the runner is disabled."""
-        return max((key.batch_size for key in self._graphs), default=0)
+        """Largest published batch dimension; 0 once the runner is disabled.
+
+        Cached at build/disable time: dispatch reads it several times per
+        step, and the key set only changes there."""
+        return self._max_captured_batch_size
 
     def stats(self) -> dict[str, Any]:
         """Return a strict JSON-safe snapshot of build and runtime state."""
