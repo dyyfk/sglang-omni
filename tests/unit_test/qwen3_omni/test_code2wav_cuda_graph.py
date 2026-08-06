@@ -672,6 +672,35 @@ def test_runtime_replay_failure_is_raised_and_disables_all_graphs() -> None:
     assert len(_model.calls) == calls_before + 1
 
 
+def test_max_captured_batch_size_follows_publish_and_disable() -> None:
+    backend = _FakeCudaBackend()
+    runner = Code2WavCudaGraphRunner.build(
+        _FakeModel(),
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=(
+            GraphKey(batch_size=1, frames=10),
+            GraphKey(batch_size=4, frames=10),
+        ),
+        cuda_api=backend,
+    )
+    assert runner.max_captured_batch_size == 4
+
+    graph = next(
+        graph
+        for graph in backend.graphs
+        if tuple(graph.static_input.shape) == (4, 16, 10)
+    )
+    graph.fail_replay = RuntimeError("replay exploded")
+    with pytest.raises(RuntimeError, match="replay exploded"):
+        runner.run(_codes(backend, 4, 10))
+    assert runner.max_captured_batch_size == 0
+
+    failed, _backend, _model = _build_runner(backend=_FakeCudaBackend(corrupt_at=0))
+    assert failed.max_captured_batch_size == 0
+
+
 def test_stats_are_strictly_json_safe_after_success_and_failure() -> None:
     successful, successful_backend, _model = _build_runner()
     successful.run(_codes(successful_backend, 3, 10))
