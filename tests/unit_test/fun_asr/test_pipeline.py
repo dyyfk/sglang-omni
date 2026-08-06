@@ -7,9 +7,16 @@ from types import SimpleNamespace
 
 import pytest
 
+import sglang_omni.models.fun_asr.engine_builder as fun_asr_builder
 import sglang_omni.models.fun_asr.stages as fun_asr_stages
+import sglang_omni.scheduling.bootstrap as bootstrap
+import sglang_omni.scheduling.engine_factory as engine_factory
+import sglang_omni.scheduling.omni_scheduler as omni_scheduler
+import sglang_omni.scheduling.sglang_backend as sglang_backend
+from sglang_omni.models.fun_asr import request_builders
 from sglang_omni.models.fun_asr.config import FunASRPipelineConfig
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
+from tests.unit_test.fakes import FakeServerArgs
 
 
 def test_fun_asr_config_uses_batched_stage_with_32_running_requests() -> None:
@@ -26,6 +33,8 @@ def test_fun_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.stages[0].factory_args["enable_pre_lm_encoder"] is True
     assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 4096
     assert config.stages[0].factory_args["pre_lm_cache_size_bytes"] == 2 * 1024**3
+    assert config.stages[0].factory_args["pre_lm_max_batch_size"] == 8
+    assert config.stages[0].factory_args["pre_lm_max_batch_wait_ms"] == 4
     assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["request_build_max_pending"] == 16
     assert (
@@ -106,39 +115,38 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
     adapter_kwargs: dict[str, object] = {}
 
     monkeypatch.setattr(
-        fun_asr_stages.AutoTokenizer,
+        fun_asr_builder.AutoTokenizer,
         "from_pretrained",
         lambda *args, **kwargs: tokenizer,
     )
     monkeypatch.setattr(
-        fun_asr_stages.AutoFeatureExtractor,
+        fun_asr_builder.AutoFeatureExtractor,
         "from_pretrained",
         lambda *args, **kwargs: SimpleNamespace(nb_max_frames=500),
     )
     monkeypatch.setattr(
-        fun_asr_stages,
+        fun_asr_builder,
         "get_visible_gpu_sm_version",
         lambda gpu_id: None,
     )
-    monkeypatch.setattr(fun_asr_stages, "init_mm_embedding_cache", lambda size: None)
+    monkeypatch.setattr(fun_asr_builder, "init_mm_embedding_cache", lambda size: None)
     monkeypatch.setattr(
-        fun_asr_stages,
+        request_builders,
         "make_fun_asr_scheduler_adapters",
         lambda **kwargs: (adapter_kwargs.update(kwargs) or object(), object()),
     )
     monkeypatch.setattr(
-        fun_asr_stages,
+        request_builders,
         "make_fun_asr_stream_output_builder",
         lambda **kwargs: stream_builder_calls.append(kwargs) or stream_output_builder,
     )
-    monkeypatch.setattr(fun_asr_stages, "ModelRunner", lambda *args, **kwargs: object())
     monkeypatch.setattr(
-        fun_asr_stages,
+        sglang_backend,
         "SGLangOutputProcessor",
         lambda **kwargs: object(),
     )
     monkeypatch.setattr(
-        fun_asr_stages,
+        omni_scheduler,
         "OmniScheduler",
         SimpleNamespace,
     )
@@ -152,7 +160,7 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
             self.close_calls += 1
 
     monkeypatch.setattr(
-        fun_asr_stages,
+        fun_asr_builder,
         "build_cache_namespace",
         lambda *args, **kwargs: "test-namespace",
     )
@@ -163,16 +171,21 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
         return service
 
     monkeypatch.setattr(
-        fun_asr_stages,
+        fun_asr_builder,
         "FunASRPreLMEncoderService",
         _make_encoder_service,
     )
 
     def _fake_server_args_builder(model_path, context_length, **overrides):
         build_kwargs.update(overrides)
-        return SimpleNamespace(**overrides)
+        server_args = FakeServerArgs(**overrides)
+        server_args.mm_attention_backend = None
+        return server_args
 
-    model_worker = SimpleNamespace(model_runner=SimpleNamespace(model=object()))
+    model_worker = SimpleNamespace(
+        gpu_id=0,
+        model_runner=SimpleNamespace(model=object()),
+    )
     infrastructure = (
         model_worker,
         object(),
@@ -184,29 +197,19 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
     )
 
     monkeypatch.setattr(
-        fun_asr_stages,
+        sglang_backend,
         "build_sglang_server_args",
         _fake_server_args_builder,
     )
     monkeypatch.setattr(
-        fun_asr_stages,
+        bootstrap,
         "create_sglang_infrastructure_defer_cuda_graph",
         lambda *args, **kwargs: (False, infrastructure),
-        raising=False,
     )
     monkeypatch.setattr(
-        fun_asr_stages,
-        "create_sglang_infrastructure",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("legacy bootstrap must not be used")
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        fun_asr_stages,
+        engine_factory,
         "validate_generation_batch_policy",
         lambda **kwargs: validations.append(kwargs),
-        raising=False,
     )
 
     scheduler = fun_asr_stages.create_sglang_fun_asr_executor("dummy")
@@ -228,8 +231,13 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
     scheduler.shutdown_callback()
     assert encoder_services[0].close_calls == 1
 
+    scheduler_without_service = fun_asr_stages.create_sglang_fun_asr_executor(
+        "dummy", enable_pre_lm_encoder=False
+    )
+    assert scheduler_without_service.shutdown_callback is None
+
     monkeypatch.setattr(
-        fun_asr_stages,
+        omni_scheduler,
         "OmniScheduler",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("factory failed")),
     )
