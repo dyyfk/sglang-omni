@@ -15,6 +15,11 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_STREAM_STRIDE,
 )
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    build_default_prefill_cuda_graph_bs,
+)
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,7 @@ logger = logging.getLogger(__name__)
 class HiggsTtsEngineBuilder(TtsEngineBuilder):
     model_name = "Higgs TTS"
     context_length = 4096
+    supports_breakable_prefill_cuda_graph = True
 
     def __init__(
         self,
@@ -78,6 +84,9 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
                 else 0.85
             ),
             "chunked_prefill_size": 8192,
+            # Qualified capture budget; longer prefills run eager.
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
+            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(512),
             "dtype": "bfloat16",
         }
 
@@ -98,7 +107,11 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         )
 
     def customize_server_args(self, server_args: Any) -> None:
-        server_args.disable_overlap_schedule = True
+        override_server_args(
+            server_args,
+            "sglang_omni.higgs_tts.disable_overlap_schedule",
+            disable_overlap_schedule=True,
+        )
 
     def setup_model(
         self,
@@ -124,8 +137,8 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         return model_runner_mod.HiggsTTSModelRunner(model_worker, output_proc)
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
+        del model
         return request_builders.make_higgs_scheduler_adapters(
-            model,
             max_new_tokens_cap=self.max_new_tokens,
             stream_stride=self.stream_stride,
             stream_followup_stride=self.stream_followup_stride,
@@ -133,6 +146,10 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         )
 
     def make_abort_callback(self) -> Any | None:
+        assert self.model is not None
+        return self.model.reset_request
+
+    def make_request_finished_callback(self) -> Any | None:
         assert self.model is not None
         return self.model.reset_request
 

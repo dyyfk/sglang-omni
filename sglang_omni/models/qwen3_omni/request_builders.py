@@ -627,6 +627,20 @@ def build_sglang_thinker_request(
     req._omni_consumed = None
     req._codec_suppress_tokens = None
 
+    # note (chenrui): recording placement here spares the thinker merge a sync on
+    # a GPU mask to find placeholders; tensors spare it walking them as well.
+    req._omni_mm_positions = None
+    if model_inputs and thinker_config is not None:
+        mm_positions: dict[str, torch.Tensor] = {}
+        for modality, orig_token_id in [
+            ("image", thinker_config.image_token_id),
+            ("video", thinker_config.video_token_id),
+            ("audio", thinker_config.audio_token_id),
+        ]:
+            match_id = pad_values.get(modality, orig_token_id)
+            mm_positions[modality] = (input_ids == match_id).nonzero(as_tuple=True)[0]
+        req._omni_mm_positions = mm_positions
+
     # Build SGLangARRequestData — output_ids points to req.output_ids
     data = SGLangARRequestData(
         input_ids=input_ids.to(dtype=torch.long),
@@ -863,7 +877,7 @@ def make_thinker_stream_output_builder():
         request_id: str, req_data: Any, req_output: Any
     ) -> list[OutgoingMessage]:
         req = getattr(req_data, "req", None)
-        if req is not None and int(getattr(req, "is_chunked", 0) or 0) > 0:
+        if req is not None and req.inflight_middle_chunks > 0:
             # While chunked prefill is still consuming prompt tokens, suppress
             # hidden-state streaming to the talker.
             # Emitting chunks this early lets prompt-side states masquerade as the

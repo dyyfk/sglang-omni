@@ -3,10 +3,38 @@
 Run this checklist before every fresh session and after environment recovery.
 `tune.py run` must not start while a mandatory gate fails.
 
+## Before anything: stop CI on the host
+
+Calibration and CI must not run concurrently (team policy, 2026-08-08).
+Pinning fixes the CPU quota, so a quiet host does not re-introduce the
+idle-host bias the pre-pinning #1260 calibration suffered from; what stopping
+CI removes is lane-lease races, reaper kills, and shared-bandwidth noise.
+
+On the runner host, before the first `run`:
+
+```bash
+# Back up, then set max_runners: 0 in
+# /home/sglang-omni/actions-runner-h100/omni-autoscaler.yaml (hot-reloaded).
+grep ^max_runners /home/sglang-omni/actions-runner-h100/omni-autoscaler.yaml  # must be 0
+pgrep -f Runner.Listener  # must print nothing once in-flight jobs drain
+```
+
+Wait for in-flight jobs to finish (or kill their job containers only with the
+user's explicit approval). Restore `max_runners` to its backed-up value as
+soon as the last calibration run completes; do not leave CI stopped while
+writing reports.
+
 ## 0. Environment bootstrap
 
 - Export `TUNE_HOST`, `TUNE_REPO_ROOT`, `TUNE_VENV_PYTHON`, `TUNE_GPU_INCLUDE`,
   and `TUNE_GPU_EXCLUDE` explicitly.
+- Every two-GPU calibration group must be pinned to exactly 32 logical cores
+  (16 physical plus their HT siblings), matching the runner-side bundle for
+  that lane. Inside a two-GPU container the picked ids are always `0,1`, so
+  the host table cannot resolve the physical lane; export `OMNI_CI_CPUSET`
+  with the borrowed lane's cores explicitly. `tune.py` warns and runs
+  unpinned when neither source provides a cpuset; such numbers must not
+  drive thresholds.
 - Source `.github/scripts/ci_env.sh` for CI-comparable defaults when available.
 - Do **not** source `~/.zshrc` / `~/.bashrc` for calibration launches; they
   often override `CUDA_VISIBLE_DEVICES` and break multi-group pinning.
@@ -17,13 +45,21 @@ Run this checklist before every fresh session and after environment recovery.
 
 ## 1. Scope and provenance
 
-- Confirm model, selected stages, repeats (default 5), and layout mode
+- Confirm model, selected stages, repeats (baseline 5 clean observations per
+  stage; destructive rounds are rejected and replenished on top), and layout mode
   (A / B / C in `SKILL.md`). Prefer Mode C for multi-group hosts unless the
-  user asks for one shared worst-of-five (Mode B).
+  user asks for one shared worst-of-N (Mode B).
 - Record `git rev-parse HEAD`.
 - Use a fresh `.tune-runs/<UTC>_<label>/` per calibration process unless
   explicitly resuming.
-- Resume only when `HEAD` matches the run plan.
+- Resume when `HEAD` matches the run plan, or when `run --resume` proves the
+  commits measurement-equivalent and says so. It prints either
+  `note: HEAD moved … no measured code differs` and continues, or an error
+  naming the file whose logic changed.
+- **Never discard observations because a gate refused.** A refusal says the
+  tool would not proceed, not that the data is wrong. Check what actually
+  changed (`git diff --name-only <plan-sha>..HEAD`) before spending GPU hours
+  on a re-run; hours of valid observations have been thrown away this way.
 - Regenerate `stages.yaml` after relevant test/config changes.
 
 ## 2. GPU ownership
@@ -93,6 +129,11 @@ specific gap.
 - Required Hugging Face model and dataset snapshots are locally available.
 - Speaker-similarity weights and completion marker exist for TTS stages.
 - UTMOS assets are warmed before TTS calibration.
+- The FlashInfer JIT cache is warm for the stages being calibrated. A cold
+  `fused_moe_90` build takes about eight minutes on a pinned 16-core cpuset
+  and burns startup-timeout rounds until it lands. Warm it with one
+  throwaway server launch, or calibrate from a container that has run the
+  model before.
 - This group’s cache root and `.torchinductor` are writable.
 - Concurrent groups must not share a writable FlashInfer JIT dir that another
   group may delete mid-run.
@@ -144,18 +185,26 @@ and `nvidia-smi`.
 Stop on CUDA initialization failure, extraction warnings, wrong sample scope,
 or cleanup affecting GPUs outside the configured group.
 
+A `round N REJECTED as destructive` line is **not** a stop condition — `run`
+replaces the round on its own. Intervene only when it reports that a unit hit
+the restart or round cap, which means the host is too contended to calibrate.
+
 ## 8. Completion
 
 Before report or apply:
 
-- every selected stage has N/N strict observations (`strict-audit`);
+- every selected stage has at least `repeats` clean strict observations
+  (`strict-audit`); `D` cells are rejected destructive rounds and do not count,
+  so a ready stage may show more than `repeats` cells;
 - `status` reports `missing=[]` (pytest exit 1 from old threshold asserts does
   not by itself mean missing metrics — see `CONTRACT.md`);
-- every observation has full expected sample scope and all metrics;
+- every counted observation has full expected sample scope and all metrics;
 - git provenance passes;
 - `report` succeeds through `validate_run_ready()`;
 - no calibration or pytest process remains alive for that run directory;
 - for speed metrics, skim per-run spread before apply (see `SKILL.md` /
-  `CONTRACT.md` speed health check). If a stage’s five runs show large
+  `CONTRACT.md` speed health check). If a stage’s clean runs still show large
   relative range (rough guide: throughput or latency span ≳ 20–30%), flag it
-  and ask before applying large loosens.
+  and ask before applying large loosens;
+- read the report’s **Suspected real defects** section: correctness metrics
+  that moved in a rejected round are investigation leads, not noise.
