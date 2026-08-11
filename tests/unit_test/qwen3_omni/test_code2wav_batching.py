@@ -28,11 +28,15 @@ class _FakeGraphRunner:
     def __init__(self, model, keys) -> None:
         self._model = model
         self._keys = set(keys)
-        self.enabled = True
-        self.max_captured_batch_size = max(
-            (key.batch_size for key in self._keys), default=0
-        )
         self.calls: list[tuple[tuple[int, ...], bool, str]] = []
+
+    def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+        return tuple(
+            sorted(
+                {key.batch_size for key in self._keys if key.frames == int(frames)},
+                reverse=True,
+            )
+        )
 
     def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
         key = GraphKey(batch_size=int(codes.shape[0]), frames=int(codes.shape[-1]))
@@ -46,7 +50,11 @@ class _FakeGraphRunner:
         return Code2WavRunResult(self._model(codes), mode, key, reason)
 
     def stats(self) -> dict:
-        return {"graph_contract": {"keys": len(self._keys)}}
+        return {
+            "enabled": True,
+            "disable_reason": None,
+            "graph_contract": {"keys": len(self._keys)},
+        }
 
 
 def _make_batching_scheduler(**kwargs) -> Code2WavScheduler:
@@ -63,10 +71,7 @@ def _make_batching_scheduler(**kwargs) -> Code2WavScheduler:
 
 def _make_chunk_aligned_scheduler(**kwargs) -> Code2WavScheduler:
     model = FakeCode2WavModel(total_upsample=2)
-    runner = _FakeGraphRunner(
-        model,
-        _serial_threshold_graph_keys(2, 1) + _batched_graph_keys(2, 1, 8),
-    )
+    runner = _FakeGraphRunner(model, _batched_graph_keys(2, 1, 8))
     return Code2WavScheduler(
         model,
         device="cpu",
@@ -215,10 +220,61 @@ def test_decompose_batch() -> None:
     assert Code2WavScheduler._decompose_batch(8) == [8]
 
 
+def test_decompose_batch_against_published_sizes() -> None:
+    decompose = Code2WavScheduler._decompose_batch
+    assert decompose(7, (4, 2, 1)) == [4, 2, 1]
+    assert decompose(8, (4, 1)) == [4, 4]
+    assert decompose(7, (4,)) == [4, 3]
+    assert decompose(5, (8,)) == [5]
+    assert decompose(3, ()) == [3]
+
+
+class _AvailabilityRunner:
+    def __init__(self, sizes: tuple[int, ...]) -> None:
+        self.sizes = sizes
+        self.queries: list[int] = []
+
+    def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+        self.queries.append(frames)
+        return self.sizes
+
+
+def _states_with_ready(count: int, ready: int) -> list[tuple[str, Code2WavStreamState]]:
+    participants = []
+    for i in range(count):
+        state = Code2WavStreamState()
+        state.chunks = [torch.tensor([0, 0]) for _ in range(ready)]
+        participants.append((f"r{i}", state))
+    return participants
+
+
 def test_eager_step_plan_is_one_forward() -> None:
     scheduler = _make_batching_scheduler()
     assert scheduler._cuda_graph_runner is None
     participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
+    assert scheduler.build_step_plan(participants) == [7]
+
+
+def test_step_plan_follows_runner_availability_for_the_window() -> None:
+    runner = _AvailabilityRunner((4, 2, 1))
+    scheduler = _make_batching_scheduler(
+        enable_cuda_graph=True,
+        _cuda_graph_runner=runner,
+    )
+    participants = _states_with_ready(7, ready=6)
+    assert scheduler.build_step_plan(participants) == [4, 2, 1]
+    # The plan queries the chunk-capped window (one stream chunk), not the
+    # raw backlog depth.
+    assert runner.queries[-1] == 2
+
+
+def test_step_plan_without_published_graphs_stays_one_eager_forward() -> None:
+    runner = _AvailabilityRunner(())
+    scheduler = _make_batching_scheduler(
+        enable_cuda_graph=True,
+        _cuda_graph_runner=runner,
+    )
+    participants = _states_with_ready(7, ready=6)
     assert scheduler.build_step_plan(participants) == [7]
 
 
@@ -556,10 +612,18 @@ def test_batching_and_cuda_graph_coexist() -> None:
     assert legacy._chunk_aligned_dispatch is False
 
 
+def _ready_participants(n: int) -> list[tuple[str, Code2WavStreamState]]:
+    participants = []
+    for i in range(n):
+        state = Code2WavStreamState()
+        state.chunks = [torch.tensor([i, i * 10]), torch.tensor([i, i * 10])]
+        participants.append((f"r{i}", state))
+    return participants
+
+
 def test_chunk_aligned_step_plan_decomposes() -> None:
     scheduler = _make_chunk_aligned_scheduler()
-    participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
-    assert scheduler.build_step_plan(participants) == [4, 2, 1]
+    assert scheduler.build_step_plan(_ready_participants(7)) == [4, 2, 1]
 
 
 def test_chunk_aligned_backlog_drains_in_uniform_graph_windows() -> None:
@@ -604,11 +668,11 @@ def test_batched_graph_keys_cover_decompose_sizes() -> None:
     keys = _batched_graph_keys(2, 1, 8)
     assert set(keys) == {
         GraphKey(batch_size=size, frames=frames)
-        for size in (2, 4, 8)
+        for size in (1, 2, 4, 8)
         for frames in (2, 3)
     }
     capped = _batched_graph_keys(2, 1, 4)
-    assert {key.batch_size for key in capped} == {2, 4}
+    assert {key.batch_size for key in capped} == {1, 2, 4}
 
 
 def test_factory_builds_batched_keys_with_batching(monkeypatch) -> None:
@@ -647,7 +711,7 @@ def test_factory_builds_batched_keys_with_batching(monkeypatch) -> None:
     assert scheduler._chunk_aligned_dispatch is True
 
 
-def test_serial_only_runner_disables_chunk_aligned_dispatch() -> None:
+def test_serial_only_runner_runs_groups_as_one_whole_batch() -> None:
     model = FakeCode2WavModel(total_upsample=2)
     runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
     scheduler = Code2WavScheduler(
@@ -660,59 +724,20 @@ def test_serial_only_runner_disables_chunk_aligned_dispatch() -> None:
         enable_cuda_graph=True,
         _cuda_graph_runner=runner,
     )
-    # Note (ruoyu): without batched graphs there is no reason to pay the
-    # chunk-alignment cost: no one-chunk step cap and no 8/4/2/1 decomposition.
-    assert scheduler._chunk_aligned_dispatch is False
-    participants = [(f"r{i}", Code2WavStreamState()) for i in range(7)]
-    assert scheduler.build_step_plan(participants) == [7]
+    # Note (ruoyu): serial graphs still profit from uniform windows, but with
+    # no batched graph the group runs as one eager forward — the H100 probe
+    # put a whole-batch eager ahead of shattering into per-request replays.
+    assert scheduler._chunk_aligned_dispatch is True
+    assert scheduler.build_step_plan(_ready_participants(7)) == [7]
 
 
 def test_runtime_disable_stops_chunk_aligned_dispatch() -> None:
     scheduler = _make_chunk_aligned_scheduler()
     assert scheduler._chunk_aligned_dispatch is True
-    scheduler._cuda_graph_runner.max_captured_batch_size = 0
+    scheduler._cuda_graph_runner._keys = set()
     assert scheduler._chunk_aligned_dispatch is False
     participants = [(f"r{i}", Code2WavStreamState()) for i in range(3)]
     assert scheduler.build_step_plan(participants) == [3]
-
-
-def test_factory_retries_serial_keys_when_batched_build_fails(monkeypatch) -> None:
-    import sglang_omni.models.qwen3_omni.components.code2wav_scheduler as mod
-
-    def _fake_load(path, *, device, dtype):
-        model = FakeCode2WavModel(total_upsample=2)
-        model.config = SimpleNamespace(num_quantizers=2)
-        return model
-
-    monkeypatch.setattr(mod, "load_code2wav_model", _fake_load)
-    built_keys: list[tuple] = []
-
-    class _FakeRunnerCls:
-        @classmethod
-        def build(cls, model, **kwargs):
-            built_keys.append(tuple(kwargs["graph_keys"]))
-            runner = _FakeGraphRunner(model, kwargs["graph_keys"])
-            runner.enabled = len(built_keys) > 1
-            runner.stats = lambda: {"disable_reason": "memory_budget_exceeded"}
-            return runner
-
-    monkeypatch.setattr(mod, "Code2WavCudaGraphRunner", _FakeRunnerCls)
-    scheduler = mod.create_code2wav_scheduler(
-        "fake-path",
-        device="cpu",
-        stream_chunk_size=2,
-        left_context_size=1,
-        enable_batching=True,
-        enable_cuda_graph=True,
-        total_gpu_memory_fraction=0.05,
-    )
-    assert len(built_keys) == 2
-    assert built_keys[1] == _serial_threshold_graph_keys(2, 1)
-    assert all(key.batch_size == 1 for key in built_keys[1])
-    # Note (ruoyu): batching without batched graphs measured worse than plain
-    # serial graph replay, so the factory drops batching with the capture.
-    assert scheduler._enable_batching is False
-    assert scheduler._chunk_aligned_dispatch is False
 
 
 def test_chunk_aligned_groups_replay_batched_graphs() -> None:
@@ -725,38 +750,6 @@ def test_chunk_aligned_groups_replay_batched_graphs() -> None:
     batched_calls = [call for call in runner.calls if call[0][0] > 1]
     assert batched_calls
     assert all(mode == "cuda_graph" for _, _, mode in batched_calls)
-
-
-def test_chunk_aligned_group_key_miss_falls_back_eager() -> None:
-    model = FakeCode2WavModel(total_upsample=2)
-    # Note (ruoyu): batched graphs exist only for size 2, so a size-4
-    # sub-batch must miss and fall back instead of failing the step.
-    runner = _FakeGraphRunner(
-        model,
-        _serial_threshold_graph_keys(2, 1) + _batched_graph_keys(2, 1, 2),
-    )
-    scheduler = Code2WavScheduler(
-        model,
-        device="cpu",
-        stream_chunk_size=2,
-        left_context_size=1,
-        sample_rate=24000,
-        enable_batching=True,
-        max_batch_wait_ms=0,
-        batch_floor=2,
-        enable_cuda_graph=True,
-        _cuda_graph_runner=runner,
-    )
-    rids = [f"req-{i}" for i in range(4)]
-    _feed_batch(
-        scheduler,
-        [(rid, code) for rid in rids for code in (1, 2)],
-    )
-    miss_calls = [call for call in runner.calls if call[0][0] == 4]
-    assert miss_calls
-    assert all((eligible, mode) == (True, "eager") for _, eligible, mode in miss_calls)
-    for rid in rids:
-        assert scheduler._stream_states[rid].emitted == 2
 
 
 def test_chunk_aligned_waveforms_match_serial_reference() -> None:
@@ -809,3 +802,123 @@ def test_qwen_code2wav_run_step_emits_full_chunk_despite_output_deficit() -> Non
     decoded = scheduler.run_step([("req-1", state)], [1])
     assert decoded["req-1"].shape == (4,)
     assert state.emitted == 3
+
+
+class _StubGraphRunner:
+    """Replays through the eager model but reports cuda_graph execution, and
+    misses (eager fallback) for batch sizes it does not publish."""
+
+    def __init__(self, model, sizes: tuple[int, ...]) -> None:
+        self._model = model
+        self.sizes = sizes
+        self.run_calls: list[tuple[tuple[int, ...], bool]] = []
+
+    def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+        del frames
+        return self.sizes
+
+    def run(self, codes: torch.Tensor, *, eligible: bool = True) -> Code2WavRunResult:
+        self.run_calls.append((tuple(codes.shape), eligible))
+        key = GraphKey(batch_size=int(codes.shape[0]), frames=int(codes.shape[2]))
+        hit = eligible and key.batch_size in self.sizes
+        return Code2WavRunResult(
+            output=self._model(codes),
+            execution_mode="cuda_graph" if hit else "eager",
+            key=key,
+            fallback_reason=None if hit else "key_miss",
+        )
+
+
+def _make_graph_batching_scheduler(
+    sizes: tuple[int, ...], **kwargs
+) -> tuple[Code2WavScheduler, _StubGraphRunner]:
+    model = FakeCode2WavModel(total_upsample=2)
+    runner = _StubGraphRunner(model, sizes)
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        sample_rate=24000,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        _cuda_graph_runner=runner,
+        **kwargs,
+    )
+    return scheduler, runner
+
+
+def test_batched_step_replays_one_graph_when_size_is_published() -> None:
+    scheduler, runner = _make_graph_batching_scheduler((8, 4, 2, 1))
+    _feed_batch(
+        scheduler,
+        [("req-a", 1), ("req-a", 2), ("req-b", 3), ("req-b", 4)],
+    )
+
+    assert runner.run_calls == [((2, 2, 2), True)]
+    messages = _drain_outbox(scheduler)
+    assert sorted(m.request_id for m in messages) == ["req-a", "req-b"]
+
+
+def test_batched_step_runs_whole_batch_eager_without_batched_sizes() -> None:
+    # Only B1 graphs published: shattering the group into per-request replays
+    # measured slower on H100 than one whole-batch eager forward, so the plan
+    # keeps the group together and lets the runner fall back.
+    scheduler, runner = _make_graph_batching_scheduler((1,))
+    _feed_batch(
+        scheduler,
+        [("req-a", 1), ("req-a", 2), ("req-b", 3), ("req-b", 4)],
+    )
+
+    assert runner.run_calls == [((2, 2, 2), True)]
+    messages = _drain_outbox(scheduler)
+    assert sorted(m.request_id for m in messages) == ["req-a", "req-b"]
+
+
+def test_batch_end_event_reports_mixed_sub_batch_execution(monkeypatch) -> None:
+    import sglang_omni.models.qwen3_omni.components.code2wav_scheduler as mod
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        mod,
+        "_emit_event",
+        lambda **kw: events.append((kw["event_name"], kw["metadata"])),
+    )
+
+    class _ActiveRecorder:
+        def is_active(self) -> bool:
+            return True
+
+    monkeypatch.setattr(mod, "_get_recorder", lambda: _ActiveRecorder())
+
+    scheduler, runner = _make_graph_batching_scheduler((2,))
+    _feed_batch(
+        scheduler,
+        [
+            ("req-a", 1),
+            ("req-a", 2),
+            ("req-b", 3),
+            ("req-b", 4),
+            ("req-c", 5),
+            ("req-c", 6),
+        ],
+    )
+
+    assert runner.run_calls == [((2, 2, 2), True), ((1, 2, 2), True)]
+    end_meta = next(meta for name, meta in events if name == "code2wav_batch_end")
+    assert end_meta["execution_mode"] == "mixed"
+    assert end_meta["sub_batch_execution"] == [
+        {
+            "batch_size": 2,
+            "execution_mode": "cuda_graph",
+            "graph_key": {"batch_size": 2, "frames": 2},
+            "fallback_reason": None,
+        },
+        {
+            "batch_size": 1,
+            "execution_mode": "eager",
+            "graph_key": {"batch_size": 1, "frames": 2},
+            "fallback_reason": "key_miss",
+        },
+    ]
+    assert end_meta["subbatch_decomposition"] == [2, 1]

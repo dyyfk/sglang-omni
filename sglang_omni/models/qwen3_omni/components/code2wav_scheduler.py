@@ -6,7 +6,6 @@ runs vocoder incrementally, outputs final audio via outbox.
 """
 from __future__ import annotations
 
-import gc
 import json
 import logging
 import queue
@@ -61,13 +60,14 @@ def _batched_graph_keys(
     left_context_size: int,
     batch_ceiling: int,
 ) -> tuple[GraphKey, ...]:
-    # Note (ruoyu): chunk-aligned sub-batches decode the same windows as serial
-    # decode, so the serial frame set is the complete batched frame set too.
-    sizes = tuple(size for size in _DECOMPOSE_SIZES if 1 < size <= batch_ceiling)
-    return tuple(
-        GraphKey(batch_size=size, frames=key.frames)
-        for size in sizes
-        for key in _serial_threshold_graph_keys(stream_chunk_size, left_context_size)
+    # Same window lengths as the serial keys: the batch-former only coalesces
+    # same-bucket windows, so batching adds batch sizes, not new frame counts.
+    serial = _serial_threshold_graph_keys(stream_chunk_size, left_context_size)
+    return serial + tuple(
+        GraphKey(batch_size=batch_size, frames=key.frames)
+        for batch_size in sorted(size for size in _DECOMPOSE_SIZES if size > 1)
+        if batch_size <= batch_ceiling
+        for key in serial
     )
 
 
@@ -157,12 +157,13 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
 
     @property
     def _chunk_aligned_dispatch(self) -> bool:
-        """Chunk alignment only pays off when batched graphs are live, so it
-        follows the runner's current state rather than the startup flags."""
-        return (
-            self._enable_batching
-            and getattr(self._cuda_graph_runner, "max_captured_batch_size", 0) > 1
-        )
+        """Chunk alignment only pays off while graphs are live: uniform windows
+        keep every step inside the captured key set, so it follows the runner's
+        current published keys rather than the startup flags."""
+        if not self._enable_batching or self._cuda_graph_runner is None:
+            return False
+        steady_window = self._left_context_size + self._stream_chunk_size
+        return bool(self._cuda_graph_runner.available_batch_sizes(steady_window))
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         del payload
@@ -378,12 +379,16 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         return (context, context + self._step_frames(state))
 
     @staticmethod
-    def _decompose_batch(n: int) -> list[int]:
+    def _decompose_batch(n: int, sizes: tuple[int, ...] = (8, 4, 2, 1)) -> list[int]:
         plan: list[int] = []
-        for size in _DECOMPOSE_SIZES:
+        for size in sizes:
             while n >= size:
                 plan.append(size)
                 n -= size
+        if n:
+            # No graph covers the remainder; keep it one eager forward instead
+            # of shattering it into per-request calls.
+            plan.append(n)
         return plan
 
     def stop(self) -> None:
@@ -449,7 +454,22 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     ) -> list[int]:
         if not self._chunk_aligned_dispatch:
             return [len(participants)]
-        return self._decompose_batch(len(participants))
+        # Decompose against the batch sizes that actually hold a published
+        # graph for this window length — under memory pressure the runner may
+        # have skipped the larger batched graphs, and a sub-batch without a
+        # graph would replay nothing and eat the dispatch overhead twice.
+        window_frames = self._bucket(participants[0][1])[1]
+        sizes = tuple(
+            size
+            for size in self._cuda_graph_runner.available_batch_sizes(window_frames)
+            if size > 1
+        )
+        if not sizes:
+            # No batched graph covers this window: one whole-batch eager
+            # forward measured faster on H100 than shattering the group into
+            # per-request replays (a lone request still replays its B1 graph).
+            return [len(participants)]
+        return self._decompose_batch(len(participants), sizes)
 
     def run_step(
         self,
@@ -506,6 +526,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                     {"batch_size": len(group), **execution_metadata}
                 )
         if profile_metadata is not None:
+            modes = {entry["execution_mode"] for entry in sub_batch_execution}
             _emit_event(
                 request_id=participants[0][0],
                 stage=None,
@@ -517,6 +538,15 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                     # single-forward event consumers keep parsing; the
                     # per-sub-batch list is the authoritative record.
                     **execution_metadata,
+                    # A heterogeneous plan reports "mixed" rather than letting
+                    # the last sub-batch speak for the whole step.
+                    "execution_mode": (
+                        modes.pop()
+                        if len(modes) == 1
+                        else "mixed"
+                        if modes
+                        else "eager"
+                    ),
                     "sub_batch_execution": sub_batch_execution,
                 },
             )
@@ -612,16 +642,16 @@ def create_code2wav_scheduler(
     model = load_code2wav_model(model_path, device=device, dtype=dtype)
     cuda_graph_runner = None
     if enable_cuda_graph:
-        serial_keys = _serial_threshold_graph_keys(
-            stream_chunk_size,
-            left_context_size,
-        )
-        graph_keys = serial_keys
         if enable_batching:
-            graph_keys = graph_keys + _batched_graph_keys(
+            graph_keys = _batched_graph_keys(
                 stream_chunk_size,
                 left_context_size,
-                batch_ceiling,
+                min(max(int(batch_ceiling), 1), 8),
+            )
+        else:
+            graph_keys = _serial_threshold_graph_keys(
+                stream_chunk_size,
+                left_context_size,
             )
         cuda_graph_runner = Code2WavCudaGraphRunner.build(
             model,
@@ -630,24 +660,15 @@ def create_code2wav_scheduler(
             total_gpu_memory_fraction=total_gpu_memory_fraction,
             graph_keys=graph_keys,
         )
-        if len(graph_keys) > len(serial_keys) and not cuda_graph_runner.enabled:
-            # Note (ruoyu): the build is all-or-nothing, so a failed batched
-            # capture would take the serial graphs down with it. Batching
-            # without batched graphs measured worse than serial replay on
-            # H100, so it is dropped along with the failed capture.
+        startup_stats = cuda_graph_runner.stats()
+        if enable_batching and not startup_stats["enabled"]:
+            # Note (ruoyu): the runner shrinks the batched key set on its own,
+            # so a fully disabled runner means even serial capture failed.
+            # Batching without graph replay measured worse than serial eager
+            # on H100, so it is dropped along with the graphs.
             logger.warning(
-                "Code2Wav batched graph build failed (%s); disabling batching "
-                "and retrying with serial-only keys",
-                cuda_graph_runner.stats()["disable_reason"],
-            )
-            cuda_graph_runner = None
-            gc.collect()
-            cuda_graph_runner = Code2WavCudaGraphRunner.build(
-                model,
-                device=concrete_device,
-                num_quantizers=int(model.config.num_quantizers),
-                total_gpu_memory_fraction=total_gpu_memory_fraction,
-                graph_keys=serial_keys,
+                "Code2Wav graph capture disabled (%s); disabling batching",
+                startup_stats["disable_reason"],
             )
             enable_batching = False
         logger.info(
