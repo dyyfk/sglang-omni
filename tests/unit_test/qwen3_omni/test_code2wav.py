@@ -166,8 +166,7 @@ def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
 ) -> None:
     model = _FactoryModel(num_quantizers=12)
     runner = SimpleNamespace(
-        enabled=True,
-        max_captured_batch_size=8,
+        available_batch_sizes=lambda frames: (8, 4, 2, 1),
         stats=lambda: {"enabled": True, "disable_reason": None},
     )
     monkeypatch.setattr(
@@ -190,6 +189,91 @@ def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
     assert scheduler._enable_batching is True
     assert scheduler._cuda_graph_runner is runner
     assert scheduler._chunk_aligned_dispatch is True
+
+
+def test_qwen_code2wav_factory_combines_batching_with_cuda_graph(
+    monkeypatch,
+) -> None:
+    captured_keys: list[tuple] = []
+
+    class _RecordingRunner:
+        @staticmethod
+        def build(model, **kwargs):
+            captured_keys.append(tuple(kwargs["graph_keys"]))
+            runner = object.__new__(code2wav_scheduler.Code2WavCudaGraphRunner)
+            runner.stats = lambda: {"enabled": True, "disable_reason": None}
+            return runner
+
+    monkeypatch.setattr(
+        code2wav_scheduler,
+        "load_code2wav_model",
+        lambda *args, **kwargs: _FactoryModel(),
+    )
+    monkeypatch.setattr(
+        code2wav_scheduler,
+        "Code2WavCudaGraphRunner",
+        _RecordingRunner,
+    )
+
+    scheduler = code2wav_scheduler.create_code2wav_scheduler(
+        "dummy",
+        device="cuda:0",
+        enable_batching=True,
+        batch_ceiling=4,
+        enable_cuda_graph=True,
+        total_gpu_memory_fraction=0.02,
+    )
+
+    assert scheduler._enable_batching is True
+    assert scheduler._cuda_graph_runner is not None
+    (keys,) = captured_keys
+    frames = (10, 20, 30, 35)
+    assert keys == tuple(
+        code2wav_scheduler.GraphKey(batch_size=1, frames=f) for f in frames
+    ) + tuple(
+        code2wav_scheduler.GraphKey(batch_size=b, frames=f)
+        for b in (2, 4)
+        for f in frames
+    )
+
+
+def test_qwen_code2wav_factory_disables_batching_when_runner_disabled(
+    monkeypatch,
+) -> None:
+    build_calls: list[tuple] = []
+
+    class _DisabledRunner:
+        @staticmethod
+        def build(model, **kwargs):
+            build_calls.append(tuple(kwargs["graph_keys"]))
+            runner = object.__new__(code2wav_scheduler.Code2WavCudaGraphRunner)
+            runner.stats = lambda: {"enabled": False, "disable_reason": "test"}
+            return runner
+
+    monkeypatch.setattr(
+        code2wav_scheduler,
+        "load_code2wav_model",
+        lambda *args, **kwargs: _FactoryModel(),
+    )
+    monkeypatch.setattr(
+        code2wav_scheduler,
+        "Code2WavCudaGraphRunner",
+        _DisabledRunner,
+    )
+
+    scheduler = code2wav_scheduler.create_code2wav_scheduler(
+        "dummy",
+        device="cuda:0",
+        enable_batching=True,
+        enable_cuda_graph=True,
+        total_gpu_memory_fraction=0.02,
+    )
+
+    # The runner degrades internally, so the factory never rebuilds; it only
+    # drops batching once the runner reports itself fully disabled.
+    assert len(build_calls) == 1
+    assert scheduler._enable_batching is False
+    assert scheduler._chunk_aligned_dispatch is False
 
 
 @pytest.mark.parametrize(
