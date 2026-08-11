@@ -263,8 +263,8 @@ def test_step_plan_follows_runner_availability_for_the_window() -> None:
     )
     participants = _states_with_ready(7, ready=6)
     assert scheduler.build_step_plan(participants) == [4, 2, 1]
-    # The plan queries the chunk-capped window (one stream chunk), not the
-    # raw backlog depth.
+    # Note (ruoyu): the plan must query the chunk-capped window, not the raw
+    # backlog depth — an uncapped query would miss the captured key set.
     assert runner.queries[-1] == 2
 
 
@@ -861,9 +861,9 @@ def test_batched_step_replays_one_graph_when_size_is_published() -> None:
 
 
 def test_batched_step_runs_whole_batch_eager_without_batched_sizes() -> None:
-    # Only B1 graphs published: shattering the group into per-request replays
-    # measured slower on H100 than one whole-batch eager forward, so the plan
-    # keeps the group together and lets the runner fall back.
+    # Note (ruoyu): shattering into per-request replays measured slower on
+    # H100 than one whole-batch eager forward, so the plan keeps the group
+    # together and lets the runner fall back.
     scheduler, runner = _make_graph_batching_scheduler((1,))
     _feed_batch(
         scheduler,

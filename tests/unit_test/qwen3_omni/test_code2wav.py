@@ -269,8 +269,8 @@ def test_qwen_code2wav_factory_disables_batching_when_runner_disabled(
         total_gpu_memory_fraction=0.02,
     )
 
-    # The runner degrades internally, so the factory never rebuilds; it only
-    # drops batching once the runner reports itself fully disabled.
+    # Note (ruoyu): the runner degrades internally, so the factory never
+    # rebuilds; it only drops batching once the runner is fully disabled.
     assert len(build_calls) == 1
     assert scheduler._enable_batching is False
     assert scheduler._chunk_aligned_dispatch is False
