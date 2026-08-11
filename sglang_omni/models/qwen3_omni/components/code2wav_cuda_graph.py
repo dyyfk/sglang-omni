@@ -179,6 +179,10 @@ class Code2WavCudaGraphRunner:
         self._owner_pid = os.getpid()
         self._cuda = cuda_api
         self._graphs: dict[GraphKey, _CapturedGraph] = {}
+        # Note (ruoyu): the scheduler reads the published sizes several times
+        # per step, so they are cached and refreshed where the key set changes
+        # (publish, rollback, runtime disable) instead of rescanned per call.
+        self._sizes_by_frames: dict[int, tuple[int, ...]] = {}
         self._pool: Any | None = None
         self._capture_stream: Any | None = None
         self._enabled = False
@@ -281,6 +285,13 @@ class Code2WavCudaGraphRunner:
         self._capture_stream = capture_stream
         self._graphs = {
             key: temporary[key] for key in self._graph_keys if key in temporary
+        }
+        sizes_by_frames: dict[int, set[int]] = {}
+        for key in self._graphs:
+            sizes_by_frames.setdefault(key.frames, set()).add(key.batch_size)
+        self._sizes_by_frames = {
+            frames: tuple(sorted(sizes, reverse=True))
+            for frames, sizes in sizes_by_frames.items()
         }
         self._build_stats["published_graph_count"] = len(self._graphs)
         if self._tier1_keys:
@@ -465,12 +476,7 @@ class Code2WavCudaGraphRunner:
     def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
         """Batch sizes with a published graph for this window length, largest
         first; the scheduler decomposes coalesced batches against this."""
-        return tuple(
-            sorted(
-                {key.batch_size for key in self._graphs if key.frames == int(frames)},
-                reverse=True,
-            )
-        )
+        return self._sizes_by_frames.get(int(frames), ())
 
     def _capture_graph(
         self,
@@ -557,6 +563,7 @@ class Code2WavCudaGraphRunner:
                     snapshot_exc,
                 )
         self._graphs.clear()
+        self._sizes_by_frames = {}
         temporary.clear()
         self._pool = None
         self._capture_stream = None
@@ -660,6 +667,7 @@ class Code2WavCudaGraphRunner:
 
     def _disable_runtime(self, reason: str) -> None:
         self._graphs.clear()
+        self._sizes_by_frames = {}
         self._pool = None
         self._capture_stream = None
         self._enabled = False
