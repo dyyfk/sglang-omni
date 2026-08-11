@@ -182,12 +182,15 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
             _serial_threshold_graph_keys,
         )
 
-        graph_keys = _serial_threshold_graph_keys(
-            args.stream_chunk_size, args.left_context_size
-        )
         if "quantized" in args.arms:
-            graph_keys = graph_keys + _batched_graph_keys(
+            # Serial keys are included by _batched_graph_keys since the 1-pool
+            # merge; adding them again would capture every serial graph twice.
+            graph_keys = _batched_graph_keys(
                 args.stream_chunk_size, args.left_context_size, args.ceiling
+            )
+        else:
+            graph_keys = _serial_threshold_graph_keys(
+                args.stream_chunk_size, args.left_context_size
             )
         graph_runner = Code2WavCudaGraphRunner.build(
             model,
@@ -196,11 +199,20 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
             total_gpu_memory_fraction=args.graph_memory_fraction,
             graph_keys=graph_keys,
         )
-        if not graph_runner.enabled:
+        startup_stats = graph_runner.stats()
+        if not startup_stats["enabled"]:
             # A degraded arm would silently measure the wrong mechanism.
             raise RuntimeError(
-                "code2wav graph build failed: "
-                f"{graph_runner.stats()['disable_reason']}"
+                "code2wav graph build failed: " f"{startup_stats['disable_reason']}"
+            )
+        published = startup_stats["build"]["published_graph_count"]
+        if published < len(graph_keys):
+            # Shrink is legitimate under a tight budget (that IS the prod
+            # behavior at 0.02) — record it loudly instead of failing.
+            print(
+                f"[graph] published {published}/{len(graph_keys)} keys at "
+                f"fraction {args.graph_memory_fraction}",
+                flush=True,
             )
     return ModelContext(
         model=model,
