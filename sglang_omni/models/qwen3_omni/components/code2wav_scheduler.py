@@ -465,9 +465,9 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             if size > 1
         )
         if not sizes:
-            # No batched graph covers this window: one whole-batch eager
-            # forward measured faster on H100 than shattering the group into
-            # per-request replays (a lone request still replays its B1 graph).
+            # Note (ruoyu): one whole-batch eager forward measured faster on
+            # H100 than shattering the group into per-request replays; a lone
+            # request still replays its B1 graph.
             return [len(participants)]
         return self._decompose_batch(len(participants), sizes)
 
@@ -538,8 +538,8 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                     # single-forward event consumers keep parsing; the
                     # per-sub-batch list is the authoritative record.
                     **execution_metadata,
-                    # A heterogeneous plan reports "mixed" rather than letting
-                    # the last sub-batch speak for the whole step.
+                    # Note (jiaqi): a heterogeneous plan reports "mixed" rather
+                    # than letting the last sub-batch speak for the whole step.
                     "execution_mode": (
                         modes.pop()
                         if len(modes) == 1
