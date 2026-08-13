@@ -442,31 +442,38 @@ def test_real_cuda_invalid_capture_preserves_current_stream() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_real_cuda_build_and_replay_matches_eager() -> None:
+def test_real_cuda_shared_pool_replays_batch_sizes_with_eager_parity() -> None:
     class _TinyCode2WavModel(torch.nn.Module):
         def forward(self, codes: torch.Tensor) -> torch.Tensor:
             return (codes.float() * 2).sum(dim=1, keepdim=True)
 
     device = torch.device("cuda", torch.cuda.current_device())
     model = _TinyCode2WavModel().to(device).eval()
+    graph_keys = (
+        GraphKey(batch_size=1, frames=10),
+        GraphKey(batch_size=2, frames=10),
+    )
     runner = Code2WavCudaGraphRunner.build(
         model,
         device=device,
         num_quantizers=2,
         total_gpu_memory_fraction=1.0,
-        graph_keys=_DEFAULT_GRAPH_KEYS,
+        graph_keys=graph_keys,
     )
 
     stats = runner.stats()
     assert stats["enabled"] is True
-    assert stats["build"]["published_graph_count"] == len(_DEFAULT_GRAPH_KEYS)
+    assert stats["build"]["published_graph_count"] == len(graph_keys)
 
-    for key in _DEFAULT_GRAPH_KEYS:
-        codes = torch.arange(
-            key.batch_size * 2 * key.frames,
-            dtype=torch.long,
-            device=device,
-        ).reshape(key.batch_size, 2, key.frames)
+    for replay_index, key in enumerate((*graph_keys, *graph_keys)):
+        codes = (
+            torch.arange(
+                key.batch_size * 2 * key.frames,
+                dtype=torch.long,
+                device=device,
+            ).reshape(key.batch_size, 2, key.frames)
+            + replay_index * 1000
+        )
         with torch.inference_mode():
             eager = model(codes).clone()
         result = runner.run(codes)
