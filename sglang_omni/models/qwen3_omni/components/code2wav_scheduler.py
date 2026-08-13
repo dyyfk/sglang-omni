@@ -543,9 +543,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                     "execution_mode": (
                         modes.pop()
                         if len(modes) == 1
-                        else "mixed"
-                        if modes
-                        else "eager"
+                        else "mixed" if modes else "eager"
                     ),
                     "sub_batch_execution": sub_batch_execution,
                 },
