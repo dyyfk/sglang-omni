@@ -340,7 +340,39 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             return None
         return min(due) + self._max_batch_wait_s
 
+    def _drain_inbox(self):
+        while True:
+            try:
+                yield self.inbox.get_nowait()
+            except queue.Empty:
+                return
+
     def _next_message(self):
+        if self._can_batch_stream_chunks:
+            first_chunks: list = []
+            for msg in self._drain_inbox():
+                if (
+                    msg.type == "stream_chunk"
+                    and msg.request_id not in self._stream_states
+                    and not self._is_aborted(msg.request_id)
+                ):
+                    first_chunks.append(msg)
+                else:
+                    self._pending_messages.append(msg)
+            if first_chunks:
+                self._handle_stream_chunk_batch(first_chunks)
+            if (
+                self._pending_messages
+                and self._pending_messages[0].type == "stream_chunk"
+            ):
+                run: list = []
+                while (
+                    self._pending_messages
+                    and self._pending_messages[0].type == "stream_chunk"
+                ):
+                    run.append(self._pending_messages.popleft())
+                self._handle_stream_chunk_batch(run)
+                return None
         if self._pending_messages:
             return self._pending_messages.popleft()
         deadline = self._batch_deadline()
