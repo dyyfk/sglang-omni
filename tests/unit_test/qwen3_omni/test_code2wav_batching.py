@@ -711,7 +711,7 @@ def test_factory_builds_batched_keys_with_batching(monkeypatch) -> None:
     assert scheduler._chunk_aligned_dispatch is True
 
 
-def test_serial_only_runner_runs_groups_as_one_whole_batch() -> None:
+def test_serial_only_runner_splits_groups_into_safe_b1_replays() -> None:
     model = FakeCode2WavModel(total_upsample=2)
     runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
     scheduler = Code2WavScheduler(
@@ -724,11 +724,11 @@ def test_serial_only_runner_runs_groups_as_one_whole_batch() -> None:
         enable_cuda_graph=True,
         _cuda_graph_runner=runner,
     )
-    # Note (ruoyu): serial graphs still profit from uniform windows, but with
-    # no batched graph the group runs as one eager forward — the H100 probe
-    # put a whole-batch eager ahead of shattering into per-request replays.
+    # Note (ruoyu): a serial-only runner may have dropped batched graphs after
+    # their eager warmup OOMed, so retrying the group as one eager forward is
+    # unsafe even when it benchmarks faster in the non-OOM case.
     assert scheduler._chunk_aligned_dispatch is True
-    assert scheduler.build_step_plan(_ready_participants(7)) == [7]
+    assert scheduler.build_step_plan(_ready_participants(7)) == [1] * 7
 
 
 def test_runtime_disable_stops_chunk_aligned_dispatch() -> None:
@@ -860,17 +860,16 @@ def test_batched_step_replays_one_graph_when_size_is_published() -> None:
     assert sorted(m.request_id for m in messages) == ["req-a", "req-b"]
 
 
-def test_batched_step_runs_whole_batch_eager_without_batched_sizes() -> None:
-    # Note (ruoyu): shattering into per-request replays measured slower on
-    # H100 than one whole-batch eager forward, so the plan keeps the group
-    # together and lets the runner fall back.
+def test_batched_step_replays_b1_graphs_without_batched_sizes() -> None:
+    # Note (ruoyu): a serial-only runner can mean batched eager warmup OOMed,
+    # so the plan must stay within its published B1 capacity.
     scheduler, runner = _make_graph_batching_scheduler((1,))
     _feed_batch(
         scheduler,
         [("req-a", 1), ("req-a", 2), ("req-b", 3), ("req-b", 4)],
     )
 
-    assert runner.run_calls == [((2, 2, 2), True)]
+    assert runner.run_calls == [((1, 2, 2), True), ((1, 2, 2), True)]
     messages = _drain_outbox(scheduler)
     assert sorted(m.request_id for m in messages) == ["req-a", "req-b"]
 
