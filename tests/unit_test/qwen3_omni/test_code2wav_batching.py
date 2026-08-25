@@ -1199,3 +1199,50 @@ def test_adaptive_regime_recorded_in_batch_event(monkeypatch) -> None:
     start_meta = next(meta for name, meta in events if name == "code2wav_batch_start")
     assert start_meta["adaptive_regime"] == "latency"
     assert start_meta["fire_reason"] == "deadline"
+
+
+def test_adaptive_requires_graph_runner() -> None:
+    with pytest.raises(ValueError):
+        Code2WavScheduler(
+            FakeCode2WavModel(total_upsample=2),
+            device="cpu",
+            stream_chunk_size=2,
+            left_context_size=1,
+            enable_batching=True,
+            enable_adaptive_dispatch=True,
+        )
+
+
+def test_adaptive_serial_only_graphs_stay_zero_wait() -> None:
+    # A tier1-shrunk runner still publishes the B1 serial keys, so
+    # available_batch_sizes is (1,); a formed batch would decompose into
+    # serial replays, so the adaptive wait must stay disengaged.
+    model = FakeCode2WavModel(total_upsample=2)
+    runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        sample_rate=24000,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        _cuda_graph_runner=runner,
+        enable_adaptive_dispatch=True,
+        max_batch_wait_ms=1000,
+        batch_floor=8,
+    )
+    assert scheduler._chunk_aligned_dispatch is True
+    scheduler._stream_states = {f"r{i}": Code2WavStreamState() for i in range(20)}
+    assert scheduler._effective_max_batch_wait_s() == 0.0
+
+
+def test_batch_deadline_uses_effective_wait() -> None:
+    scheduler = _make_adaptive_scheduler(max_batch_wait_ms=1000, batch_floor=8)
+    due_since = time.monotonic()
+    states = {f"r{i}": Code2WavStreamState() for i in range(11)}
+    states["r0"].due_since = due_since
+    scheduler._stream_states = states
+    assert scheduler._batch_deadline() == due_since
+    scheduler._stream_states["r11"] = Code2WavStreamState()
+    assert scheduler._batch_deadline() == due_since + 1.0

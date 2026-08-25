@@ -196,8 +196,13 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         )
         self._batch_ceiling = min(max(int(batch_ceiling), 1), _DECOMPOSE_SIZES[0])
         self._enable_adaptive_dispatch = bool(enable_adaptive_dispatch)
-        if self._enable_adaptive_dispatch and not self._enable_batching:
-            raise ValueError("enable_adaptive_dispatch requires enable_batching")
+        if self._enable_adaptive_dispatch and not (
+            self._enable_batching and self._cuda_graph_runner is not None
+        ):
+            raise ValueError(
+                "enable_adaptive_dispatch requires enable_batching "
+                "and enable_cuda_graph"
+            )
         self._drain_mode = False
         self._last_fire_reason: str | None = None
         self._last_adaptive_regime: str | None = None
@@ -235,12 +240,23 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         """Wait budget for the current decision point."""
         if not self._enable_adaptive_dispatch:
             return self._max_batch_wait_s
-        # Note (ruoyu): waiting only pays when both batched graph replay is
-        # live and traffic is heavy — #1026 showed wait/floor batching loses
-        # ~4x without graphs, and the #1237 A/B showed it loses below
-        # concurrency 16 even with them. On either miss, dispatch zero-wait.
+        # Note (ruoyu): waiting only pays when batched graph replay is live
+        # and traffic is heavy — #1026 showed wait/floor batching loses ~4x
+        # without graphs, and the #1237 A/B showed it loses below concurrency
+        # 16 even with them. Batch-size 1 alone does not count as live: a
+        # tier1-shrunk runner decomposes every group into serial B1 replays
+        # (build_step_plan), so a formed batch buys nothing over firing solo.
+        # Active-stream count (not due-count) is the load signal because the
+        # A/B calibrated the crossover on client concurrency.
+        if not self._chunk_aligned_dispatch:
+            return 0.0
+        steady_window = self._left_context_size + self._stream_chunk_size
+        batched_live = any(
+            size > 1
+            for size in self._cuda_graph_runner.available_batch_sizes(steady_window)
+        )
         engaged = (
-            self._chunk_aligned_dispatch
+            batched_live
             and len(self._stream_states) >= _ADAPTIVE_WAIT_MIN_ACTIVE_STREAMS
         )
         return self._max_batch_wait_s if engaged else 0.0
@@ -647,9 +663,9 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 for _, state in self._stream_state_items()
                 if state.due_since is not None
             ]
-        if not due:
-            return None
-        return min(due) + self._effective_max_batch_wait_s()
+            if not due:
+                return None
+            return min(due) + self._effective_max_batch_wait_s()
 
     def _drain_inbox(self):
         while True:
