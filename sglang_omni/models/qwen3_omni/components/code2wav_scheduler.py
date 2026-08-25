@@ -39,6 +39,13 @@ logger = logging.getLogger(__name__)
 # ceiling all derive from this tuple so a captured key can never go missing.
 _DECOMPOSE_SIZES = (8, 4, 2, 1)
 
+# Note (ruoyu): adaptive dispatch applies the configured wait/floor only at
+# or above this many active streams. The #1237 H100 A/B brackets the
+# crossover: at concurrency 8 zero-wait beats wait-8/floor-8 (+11% vs +6%
+# xRT) while at 16 waiting wins outright (+51% vs +15%); 12 is the midpoint
+# of that measured bracket, pending the #1236 adaptive-arm sweep.
+_ADAPTIVE_WAIT_MIN_ACTIVE_STREAMS = 12
+
 
 def _serial_threshold_graph_keys(
     stream_chunk_size: int,
@@ -160,6 +167,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         max_batch_wait_ms: int = 0,
         batch_floor: int = 2,
         batch_ceiling: int = 8,
+        enable_adaptive_dispatch: bool = False,
         enable_output_overlap: bool = True,
         enable_cuda_graph: bool = False,
         _cuda_graph_runner: Code2WavCudaGraphRunner | None = None,
@@ -187,8 +195,12 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             max(int(initial_codec_chunk_frames), 0), int(stream_chunk_size)
         )
         self._batch_ceiling = min(max(int(batch_ceiling), 1), _DECOMPOSE_SIZES[0])
+        self._enable_adaptive_dispatch = bool(enable_adaptive_dispatch)
+        if self._enable_adaptive_dispatch and not self._enable_batching:
+            raise ValueError("enable_adaptive_dispatch requires enable_batching")
         self._drain_mode = False
         self._last_fire_reason: str | None = None
+        self._last_adaptive_regime: str | None = None
         self._last_oldest_wait_ms: float = 0.0
         self._last_due_bucket_count: int = 0
         self._pending_step_failures: list[str] = []
@@ -218,6 +230,20 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             return False
         steady_window = self._left_context_size + self._stream_chunk_size
         return bool(self._cuda_graph_runner.available_batch_sizes(steady_window))
+
+    def _effective_max_batch_wait_s(self) -> float:
+        """Wait budget for the current decision point."""
+        if not self._enable_adaptive_dispatch:
+            return self._max_batch_wait_s
+        # Note (ruoyu): waiting only pays when both batched graph replay is
+        # live and traffic is heavy — #1026 showed wait/floor batching loses
+        # ~4x without graphs, and the #1237 A/B showed it loses below
+        # concurrency 16 even with them. On either miss, dispatch zero-wait.
+        engaged = (
+            self._chunk_aligned_dispatch
+            and len(self._stream_states) >= _ADAPTIVE_WAIT_MIN_ACTIVE_STREAMS
+        )
+        return self._max_batch_wait_s if engaged else 0.0
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         del payload
@@ -623,7 +649,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             ]
         if not due:
             return None
-        return min(due) + self._max_batch_wait_s
+        return min(due) + self._effective_max_batch_wait_s()
 
     def _drain_inbox(self):
         while True:
@@ -775,6 +801,9 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
 
     def select_step_participants(self) -> list[tuple[str, Code2WavStreamState]]:
         now = time.monotonic()
+        max_wait_s = self._effective_max_batch_wait_s()
+        if self._enable_adaptive_dispatch:
+            self._last_adaptive_regime = "throughput" if max_wait_s > 0.0 else "latency"
         first_ready: list[tuple[str, Code2WavStreamState]] = []
         due: dict[tuple[int, int], list[tuple[str, Code2WavStreamState]]] = {}
         for rid, state in self._stream_state_items():
@@ -803,14 +832,14 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         oldest_wait = now - anchor[0][1].due_since
         fire = (
             len(anchor) >= self._batch_floor
-            or oldest_wait >= self._max_batch_wait_s
+            or oldest_wait >= max_wait_s
             or self._drain_mode
         )
         if not fire:
             return []
         if len(anchor) >= self._batch_floor:
             reason = "floor"
-        elif oldest_wait >= self._max_batch_wait_s:
+        elif oldest_wait >= max_wait_s:
             reason = "deadline"
         else:
             reason = "drain"
@@ -860,6 +889,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 "inbox_depth": self.inbox.qsize(),
                 "oldest_wait_ms": self._last_oldest_wait_ms,
                 "fire_reason": self._last_fire_reason,
+                "adaptive_regime": self._last_adaptive_regime,
                 "due_bucket_count": self._last_due_bucket_count,
                 "subbatch_decomposition": list(plan),
             }
@@ -991,6 +1021,7 @@ def create_code2wav_scheduler(
     max_batch_wait_ms: int = 0,
     batch_floor: int = 2,
     batch_ceiling: int = 8,
+    enable_adaptive_dispatch: bool = False,
     enable_output_overlap: bool = True,
     enable_cuda_graph: bool = False,
     total_gpu_memory_fraction: float | None = None,
@@ -1000,6 +1031,10 @@ def create_code2wav_scheduler(
         raise ValueError(
             "Code2Wav CUDA graph requires "
             "runtime.resources.total_gpu_memory_fraction"
+        )
+    if enable_adaptive_dispatch and not (enable_batching and enable_cuda_graph):
+        raise ValueError(
+            "enable_adaptive_dispatch requires enable_batching and enable_cuda_graph"
         )
     concrete_device = torch.device(resolve_device_spec(device, gpu_id))
     if concrete_device.type != "cpu" and concrete_device.index is None:
@@ -1041,6 +1076,7 @@ def create_code2wav_scheduler(
                 startup_stats["disable_reason"],
             )
             enable_batching = False
+            enable_adaptive_dispatch = False
         logger.info(
             "Code2Wav CUDA graph startup stats=%s",
             json.dumps(
@@ -1059,6 +1095,7 @@ def create_code2wav_scheduler(
         max_batch_wait_ms=max_batch_wait_ms,
         batch_floor=batch_floor,
         batch_ceiling=batch_ceiling,
+        enable_adaptive_dispatch=enable_adaptive_dispatch,
         enable_output_overlap=enable_output_overlap,
         enable_cuda_graph=enable_cuda_graph,
         _cuda_graph_runner=cuda_graph_runner,

@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
@@ -992,3 +993,209 @@ def test_next_message_keeps_steady_chunks_in_fifo_order() -> None:
     assert scheduler._next_message() is None
     assert batches == [2]
     assert scheduler._stream_states["req-a"].emitted == 4
+
+
+# ---------------------------------------------------------------------------
+# Adaptive dispatch (traffic-aware policy, #1236)
+
+
+def _make_adaptive_scheduler(**kwargs) -> Code2WavScheduler:
+    return _make_chunk_aligned_scheduler(enable_adaptive_dispatch=True, **kwargs)
+
+
+def _register_streams(scheduler: Code2WavScheduler, count: int) -> None:
+    """Bring ``count`` streams past their first window so they count as
+    active steady-state traffic."""
+    for i in range(count):
+        _feed_batch(scheduler, [(f"req-{i}", 1), (f"req-{i}", 2)])
+    _drain_outbox(scheduler)
+    scheduler._model.calls.clear()
+
+
+def test_adaptive_requires_batching() -> None:
+    with pytest.raises(ValueError):
+        Code2WavScheduler(
+            FakeCode2WavModel(total_upsample=2),
+            device="cpu",
+            stream_chunk_size=2,
+            left_context_size=1,
+            enable_adaptive_dispatch=True,
+        )
+
+
+def test_factory_rejects_adaptive_without_prereqs() -> None:
+    import sglang_omni.models.qwen3_omni.components.code2wav_scheduler as mod
+
+    with pytest.raises(ValueError):
+        mod.create_code2wav_scheduler(
+            "fake-path",
+            device="cpu",
+            enable_batching=True,
+            enable_adaptive_dispatch=True,
+        )
+    with pytest.raises(ValueError):
+        mod.create_code2wav_scheduler(
+            "fake-path",
+            device="cpu",
+            enable_cuda_graph=True,
+            total_gpu_memory_fraction=0.05,
+            enable_adaptive_dispatch=True,
+        )
+
+
+def test_factory_adaptive_flag_reaches_scheduler(monkeypatch) -> None:
+    import sglang_omni.models.qwen3_omni.components.code2wav_scheduler as mod
+
+    def _fake_load(path, *, device, dtype):
+        model = FakeCode2WavModel(total_upsample=2)
+        model.config = SimpleNamespace(num_quantizers=2)
+        return model
+
+    monkeypatch.setattr(mod, "load_code2wav_model", _fake_load)
+
+    class _FakeRunnerCls:
+        @classmethod
+        def build(cls, model, **kwargs):
+            return _FakeGraphRunner(model, kwargs["graph_keys"])
+
+    monkeypatch.setattr(mod, "Code2WavCudaGraphRunner", _FakeRunnerCls)
+    scheduler = mod.create_code2wav_scheduler(
+        "fake-path",
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        enable_adaptive_dispatch=True,
+        total_gpu_memory_fraction=0.05,
+    )
+    assert scheduler._enable_adaptive_dispatch is True
+    assert scheduler._chunk_aligned_dispatch is True
+
+
+def test_factory_drops_adaptive_when_capture_disabled(monkeypatch) -> None:
+    import sglang_omni.models.qwen3_omni.components.code2wav_scheduler as mod
+
+    def _fake_load(path, *, device, dtype):
+        model = FakeCode2WavModel(total_upsample=2)
+        model.config = SimpleNamespace(num_quantizers=2)
+        return model
+
+    monkeypatch.setattr(mod, "load_code2wav_model", _fake_load)
+
+    class _DisabledRunner(_FakeGraphRunner):
+        def stats(self) -> dict:
+            return {
+                "enabled": False,
+                "disable_reason": "capture_failed",
+                "graph_contract": {},
+            }
+
+    class _FakeRunnerCls:
+        @classmethod
+        def build(cls, model, **kwargs):
+            return _DisabledRunner(model, ())
+
+    monkeypatch.setattr(mod, "Code2WavCudaGraphRunner", _FakeRunnerCls)
+    scheduler = mod.create_code2wav_scheduler(
+        "fake-path",
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        enable_adaptive_dispatch=True,
+        total_gpu_memory_fraction=0.05,
+    )
+    assert scheduler._enable_batching is False
+    assert scheduler._enable_adaptive_dispatch is False
+
+
+def test_adaptive_wait_engages_at_threshold() -> None:
+    scheduler = _make_adaptive_scheduler(max_batch_wait_ms=1000, batch_floor=8)
+    scheduler._stream_states = {f"r{i}": Code2WavStreamState() for i in range(11)}
+    assert scheduler._effective_max_batch_wait_s() == 0.0
+    scheduler._stream_states["r11"] = Code2WavStreamState()
+    assert scheduler._effective_max_batch_wait_s() == 1.0
+
+
+def test_adaptive_without_published_graphs_stays_zero_wait() -> None:
+    model = FakeCode2WavModel(total_upsample=2)
+    runner = _FakeGraphRunner(model, ())
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        sample_rate=24000,
+        enable_batching=True,
+        enable_cuda_graph=True,
+        _cuda_graph_runner=runner,
+        enable_adaptive_dispatch=True,
+        max_batch_wait_ms=1000,
+        batch_floor=8,
+    )
+    scheduler._stream_states = {f"r{i}": Code2WavStreamState() for i in range(20)}
+    assert scheduler._effective_max_batch_wait_s() == 0.0
+
+
+def test_adaptive_low_load_fires_immediately() -> None:
+    scheduler = _make_adaptive_scheduler(max_batch_wait_ms=1000, batch_floor=8)
+    _feed_batch(scheduler, [("req-0", 1), ("req-0", 2)])
+    _drain_outbox(scheduler)
+    _feed_batch(scheduler, [("req-0", 3), ("req-0", 4)])
+    messages = _drain_outbox(scheduler)
+    assert [m.request_id for m in messages] == ["req-0"]
+    assert scheduler._last_fire_reason == "deadline"
+    assert scheduler._last_adaptive_regime == "latency"
+
+
+def test_adaptive_high_load_waits_for_floor() -> None:
+    scheduler = _make_adaptive_scheduler(max_batch_wait_ms=1000, batch_floor=8)
+    _register_streams(scheduler, 12)
+    for i in range(3):
+        _feed_batch(scheduler, [(f"req-{i}", 3), (f"req-{i}", 4)])
+    assert _drain_outbox(scheduler) == []
+    assert scheduler._model.calls == []
+    for i in range(3, 8):
+        _feed_batch(scheduler, [(f"req-{i}", 3), (f"req-{i}", 4)])
+    messages = _drain_outbox(scheduler)
+    assert sorted(m.request_id for m in messages) == [f"req-{i}" for i in range(8)]
+    assert scheduler._last_fire_reason == "floor"
+    assert scheduler._last_adaptive_regime == "throughput"
+    assert scheduler._model.calls == [(8, 2, 3)]
+
+
+def test_adaptive_static_semantics_when_disabled() -> None:
+    scheduler = _make_chunk_aligned_scheduler(max_batch_wait_ms=1000, batch_floor=8)
+    _register_streams(scheduler, 2)
+    _feed_batch(scheduler, [("req-0", 3), ("req-0", 4)])
+    assert _drain_outbox(scheduler) == []
+    assert scheduler._last_adaptive_regime is None
+    assert scheduler._effective_max_batch_wait_s() == 1.0
+
+
+def test_adaptive_regime_recorded_in_batch_event(monkeypatch) -> None:
+    import sglang_omni.models.qwen3_omni.components.code2wav_scheduler as mod
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        mod,
+        "_emit_event",
+        lambda **kw: events.append((kw["event_name"], kw["metadata"])),
+    )
+
+    class _ActiveRecorder:
+        def is_active(self) -> bool:
+            return True
+
+    monkeypatch.setattr(mod, "_get_recorder", lambda: _ActiveRecorder())
+
+    scheduler = _make_adaptive_scheduler(max_batch_wait_ms=1000, batch_floor=8)
+    _feed_batch(scheduler, [("req-0", 1), ("req-0", 2)])
+    _drain_outbox(scheduler)
+    events.clear()
+    _feed_batch(scheduler, [("req-0", 3), ("req-0", 4)])
+    start_meta = next(meta for name, meta in events if name == "code2wav_batch_start")
+    assert start_meta["adaptive_regime"] == "latency"
+    assert start_meta["fire_reason"] == "deadline"
