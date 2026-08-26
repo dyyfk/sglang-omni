@@ -995,10 +995,6 @@ def test_next_message_keeps_steady_chunks_in_fifo_order() -> None:
     assert scheduler._stream_states["req-a"].emitted == 4
 
 
-# ---------------------------------------------------------------------------
-# Adaptive dispatch (traffic-aware policy, #1236)
-
-
 def _make_adaptive_scheduler(**kwargs) -> Code2WavScheduler:
     return _make_chunk_aligned_scheduler(enable_adaptive_dispatch=True, **kwargs)
 
@@ -1214,9 +1210,9 @@ def test_adaptive_requires_graph_runner() -> None:
 
 
 def test_adaptive_serial_only_graphs_stay_zero_wait() -> None:
-    # A tier1-shrunk runner still publishes the B1 serial keys, so
-    # available_batch_sizes is (1,); a formed batch would decompose into
-    # serial replays, so the adaptive wait must stay disengaged.
+    # Note (ruoyu): a tier1-shrunk runner still publishes the B1 serial
+    # keys, so a formed batch would decompose into serial replays — the
+    # wait must stay disengaged even with available_batch_sizes non-empty.
     model = FakeCode2WavModel(total_upsample=2)
     runner = _FakeGraphRunner(model, _serial_threshold_graph_keys(2, 1))
     scheduler = Code2WavScheduler(
