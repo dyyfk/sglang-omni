@@ -229,7 +229,13 @@ def build_model_context(args: argparse.Namespace) -> ModelContext:
 
 
 def build_scheduler(
-    ctx: ModelContext, arm: str, args: argparse.Namespace, wait_ms: int, floor: int
+    ctx: ModelContext,
+    arm: str,
+    args: argparse.Namespace,
+    wait_ms: int,
+    floor: int,
+    *,
+    output_overlap: bool = True,
 ) -> InstrumentedCode2Wav:
     graph_arm = arm in ("serial-graph", "quantized", "adaptive")
     return InstrumentedCode2Wav(
@@ -243,6 +249,7 @@ def build_scheduler(
         batch_floor=floor,
         batch_ceiling=args.ceiling,
         enable_adaptive_dispatch=arm == "adaptive",
+        enable_output_overlap=output_overlap,
         enable_cuda_graph=graph_arm,
         _cuda_graph_runner=ctx.graph_runner if graph_arm else None,
     )
@@ -536,8 +543,14 @@ def run_equivalence(
         repeat_seed=0,
         frame_interval_s=0.0,
     )
-    control = build_scheduler(ctx, "serial-eager", args, 0, 1)
-    batched = build_scheduler(ctx, candidate_arm, args, 0, 2)
+    # #1567's output-overlap path (serial-only, CUDA-only) merges the last
+    # pending window into the tail and shifts total length by one sample vs
+    # the non-overlap paths; the gate compares dispatch numerics, so overlap
+    # is disabled on both sides to keep lengths comparable.
+    control = build_scheduler(ctx, "serial-eager", args, 0, 1, output_overlap=False)
+    batched = build_scheduler(
+        ctx, candidate_arm, args, 0, 2, output_overlap=False
+    )
     chunk = args.stream_chunk_size
     frames = plans[0].codes.shape[0]
     for plan in plans:
