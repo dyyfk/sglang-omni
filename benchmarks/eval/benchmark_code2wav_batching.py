@@ -764,7 +764,9 @@ def main(argv: list[str] | None = None) -> int:
     equivalence = None
     if args.compare_waveforms:
         candidate_arms = [
-            arm for arm in args.arms if arm in ("batched", "quantized")
+            arm
+            for arm in args.arms
+            if arm in ("batched", "quantized", "adaptive")
         ] or ["batched"]
         equivalence = []
         for candidate_arm in candidate_arms:
