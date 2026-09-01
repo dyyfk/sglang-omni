@@ -30,8 +30,13 @@ CODE2WAV_STAGE = "code2wav"
 
 
 def output_modalities(request: Any) -> set[str] | None:
-    params = getattr(request, "params", None) or {}
-    modalities = params.get("output_modalities") or params.get("modalities")
+    # The serving client forwards the API-level ``modalities`` field as
+    # ``metadata["output_modalities"]`` (same contract qwen3_omni reads).
+    metadata = getattr(request, "metadata", None) or {}
+    modalities = metadata.get("output_modalities")
+    if modalities is None:
+        params = getattr(request, "params", None) or {}
+        modalities = params.get("output_modalities") or params.get("modalities")
     if modalities is None:
         return None
     if isinstance(modalities, str):
