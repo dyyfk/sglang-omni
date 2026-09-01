@@ -72,7 +72,6 @@ def create_thinker_scheduler(
                 server_args,
                 "sglang_omni.minicpm_o.restore_cuda_graph_capture",
                 disable_cuda_graph=saved_disable_cuda_graph,
-                enable_return_hidden_states=saved_return_hidden_states,
             )
 
     (
@@ -86,7 +85,16 @@ def create_thinker_scheduler(
     ) = infrastructure
 
     if defer_cuda_graph_capture:
+        # Graphs must capture with return_hidden_states still on: the runner
+        # requests CaptureHiddenMode.FULL every decode step, and the graph's
+        # can_run gate requires an exact hidden-mode match — a graph captured
+        # without hidden capture would never replay.
         init_sglang_cuda_graphs(model_worker)
+        override_server_args(
+            server_args,
+            "sglang_omni.minicpm_o.restore_return_hidden_states",
+            enable_return_hidden_states=saved_return_hidden_states,
+        )
 
     def _should_emit_hidden(request: Any) -> bool:
         return should_generate_audio_output(request.data.stage_payload)
