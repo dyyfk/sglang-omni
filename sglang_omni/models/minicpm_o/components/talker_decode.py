@@ -170,6 +170,7 @@ class _FastBackend:
         )
         self._graph: _GraphedTalkerStep | None = None
         self._graph_failed = False
+        self._used = False
 
     @torch.no_grad()
     def prefill(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
@@ -180,10 +181,16 @@ class _FastBackend:
                 f"talker condition ({cond_len}) does not fit the static cache "
                 f"({self.max_cache_len})"
             )
+        # transformers v5's StaticLayer.update ignores the cache_position we
+        # pass and always writes at arange + cumulative_length, a device
+        # tensor the captured graph keeps advancing across replays. Without a
+        # per-request reset the write positions climb monotonically: request
+        # 2+ conditions on request 1's stale KV, and after ~4 requests the
+        # writes walk off the cache end (index_copy_ device assert).
+        if self._used:
+            self.cache.reset()
+        self._used = True
         positions = torch.arange(cond_len, dtype=torch.long, device=self.device)
-        # Reset the mask to "condition visible, everything else blocked".
-        # Stale KV content past the mask is unreachable, so the cache itself
-        # never needs zeroing between requests.
         self.mask_buf.fill_(_mask_min(self.dtype))
         self.mask_buf[..., :cond_len] = 0.0
         outputs = self.tts.model(

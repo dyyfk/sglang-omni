@@ -98,16 +98,21 @@ def test_fast_matches_compat_on_tiny_llama():
         assert torch.equal(compat, fast)
 
 
-def test_fast_backend_is_reused_across_requests():
+def test_fast_backend_reuse_is_stateless_across_requests():
+    # Request B runs on a backend that already served request A (different
+    # condition). Any state leak — stale KV attended through the mask, or an
+    # unreset StaticCache write position — makes B diverge from a fresh
+    # compat run of B.
     torch.manual_seed(0)
     tts = _TinyTTS()
     loop = TalkerDecodeLoop(tts, gen_logits_fn=_empty_gen_logits)
-    first = _generate(loop, tts, mode="fast", seed=7)
+    _generate(loop, tts, mode="fast", seed=7)
     backend = loop._fast
     assert backend is not None
-    second = _generate(loop, tts, mode="fast", seed=7)
+    fast_b = _generate(loop, tts, mode="fast", seed=21)
     assert loop._fast is backend
-    assert torch.equal(first, second)
+    compat_b = _generate(loop, tts, mode="compat", seed=21)
+    assert torch.equal(fast_b, compat_b)
 
 
 class _ScriptedModel(nn.Module):
