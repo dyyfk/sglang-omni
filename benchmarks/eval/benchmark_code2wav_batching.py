@@ -371,7 +371,8 @@ def _feed_aligned(
         for plan in plans:
             if window_start == 0:
                 clock.first_frame.setdefault(plan.request_id, time.perf_counter())
-            for k in range(window_start, window_start + chunk_size):
+            # The last window may be a sub-chunk --tail-frames remainder.
+            for k in range(window_start, min(window_start + chunk_size, frames)):
                 scheduler.inbox.put(_chunk_message(plan.request_id, k, plan.codes[k]))
     for plan in plans:
         scheduler.inbox.put(
