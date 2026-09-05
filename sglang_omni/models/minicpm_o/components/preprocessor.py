@@ -15,9 +15,14 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from transformers import AutoProcessor, AutoTokenizer
 
+from sglang_omni.models.minicpm_o.components.audio_chunking import (
+    drop_zero_token_chunks,
+    trim_zero_token_tail,
+)
 from sglang_omni.models.minicpm_o.payload_types import MiniCPMOPipelineState
 from sglang_omni.models.weight_loader import resolve_model_path
 from sglang_omni.preprocessing.audio import (
@@ -87,6 +92,12 @@ class MiniCPMOPreprocessor:
                 self._local_dir, trust_remote_code=True
             )
         return self._processor
+
+    def _audio_pool_step(self) -> int:
+        """The processor's placeholder math and the encoder's pooling share
+        ``audio_pool_step``; read it from the processor so the two stay
+        consistent (checkpoint default 5)."""
+        return int(getattr(self.processor, "pool_step", 5))
 
     async def __call__(self, payload: StagePayload) -> StagePayload:
         # Event names mirror qwen3_omni's preprocessor so the profiler's stage
@@ -205,6 +216,15 @@ class MiniCPMOPreprocessor:
             ensure_image_list_async(raw_images),
             ensure_audio_list_async(raw_audios, target_sr=16000),
         )
+        # A clip a few samples past a 30 s boundary would get a whole extra
+        # whisper window that yields zero tokens (Daily-Omni's 30 s and 60 s
+        # clips all do); trimming it changes neither the placeholder count nor
+        # the encoder rows, and saves the STFT here and a full window there.
+        pool_step = self._audio_pool_step()
+        audios = [
+            trim_zero_token_tail(np.asarray(audio), pool_step=pool_step)
+            for audio in audios
+        ]
 
         if isinstance(messages, list) and not (
             messages and all(isinstance(token, int) for token in messages)
@@ -250,12 +270,18 @@ class MiniCPMOPreprocessor:
         if audios:
             audio_bounds = _first_batch_item(processed["audio_bounds"])
             audio_feature_lens = _first_batch_item(processed["audio_feature_lens"])
+            # Belt and braces for paths the trim above cannot reach (e.g. a
+            # clip shorter than one window whose tail still rounds to zero).
+            audio_features, audio_feature_lens = drop_zero_token_chunks(
+                processed["audio_features"], audio_feature_lens, pool_step=pool_step
+            )
             mm_inputs["audio"] = {"bounds": audio_bounds, "cache_key": audio_cache_key}
-            encoder_inputs["audio_encoder"] = {
-                "audio_features": processed["audio_features"],
-                "audio_feature_lens": audio_feature_lens,
-                "cache_key": audio_cache_key,
-            }
+            if int(audio_feature_lens.numel()) > 0:
+                encoder_inputs["audio_encoder"] = {
+                    "audio_features": audio_features,
+                    "audio_feature_lens": audio_feature_lens,
+                    "cache_key": audio_cache_key,
+                }
 
         state = MiniCPMOPipelineState(
             prompt={
