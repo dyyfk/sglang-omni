@@ -10,6 +10,7 @@ injection in the thinker stage.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from sglang_omni.preprocessing.image import (
     compute_image_cache_key,
     ensure_image_list_async,
 )
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,23 @@ class MiniCPMOPreprocessor:
         return self._processor
 
     async def __call__(self, payload: StagePayload) -> StagePayload:
+        # Event names mirror qwen3_omni's preprocessor so the profiler's stage
+        # breakdown attributes CPU preprocessing time for both models.
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="preprocess_start",
+        )
+        try:
+            return await self._call_impl(payload)
+        finally:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_end",
+            )
+
+    async def _call_impl(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs
         raw_images = None
         raw_audios = None
@@ -180,8 +199,12 @@ class MiniCPMOPreprocessor:
         image_cache_key = compute_image_cache_key(raw_images)
         audio_cache_key = compute_audio_cache_key(raw_audios)
 
-        images = await ensure_image_list_async(raw_images)
-        audios = await ensure_audio_list_async(raw_audios, target_sr=16000)
+        # Media decode is I/O + CPU bound; fetch both modalities concurrently
+        # (qwen3_omni preprocessor parity).
+        images, audios = await asyncio.gather(
+            ensure_image_list_async(raw_images),
+            ensure_audio_list_async(raw_audios, target_sr=16000),
+        )
 
         if isinstance(messages, list) and not (
             messages and all(isinstance(token, int) for token in messages)
