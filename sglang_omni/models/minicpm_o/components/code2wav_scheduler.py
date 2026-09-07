@@ -58,6 +58,7 @@ class MiniCPMOCode2WavStreamState:
         default_factory=lambda: [STREAM_SILENCE_TOKEN] * STREAM_SILENCE_PREFIX
     )
     vocoder: dict | None = None
+    slot_denied: bool = False
     total_codes: int = 0
     emitted_samples: int = 0
     first_audio_emitted: bool = False
@@ -107,11 +108,9 @@ class MiniCPMOCode2WavScheduler(
         self, state: MiniCPMOCode2WavStreamState, *, is_final: bool
     ) -> bool:
         del is_final
-        if len(state.buffer) < _STREAM_WINDOW:
-            return False
-        return (
-            state.vocoder is not None or self._active_streams < self._max_active_streams
-        )
+        # Slot acquisition (and its one-shot denial) happens in decode_delta,
+        # so the first window-sized backlog must reach it.
+        return not state.slot_denied and len(state.buffer) >= _STREAM_WINDOW
 
     def decode_delta(
         self,
@@ -122,9 +121,14 @@ class MiniCPMOCode2WavScheduler(
     ) -> torch.Tensor | None:
         if state.vocoder is None:
             # No live decode session. Acquiring one at stream-done would just
-            # be a costlier one-shot (all audio lands at once either way), so
-            # short or slot-starved streams take the one-shot fallback.
-            if is_final or not self._acquire_stream_slot(request_id, state):
+            # be a costlier one-shot (all audio lands at once either way), and
+            # a stream denied once stays on the fallback path: acquiring a
+            # freed slot mid-utterance turns the request into a slow drip
+            # (v2 A/B: TTFA 5-17 s, worse than the one-shot it displaced).
+            if is_final or state.slot_denied:
+                return None
+            if not self._acquire_stream_slot(request_id, state):
+                state.slot_denied = True
                 return None
         pieces: list[np.ndarray] = []
         while len(state.buffer) >= _STREAM_WINDOW:

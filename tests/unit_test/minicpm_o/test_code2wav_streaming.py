@@ -254,13 +254,18 @@ def test_slot_cap_starves_excess_streams_into_one_shot():
     assert scheduler._active_streams == 1
     assert all(w[0][STREAM_SILENCE_PREFIX] < 100 for w in vocoder.stream_windows)
 
-    scheduler._on_done("req-b")
-    # Slot still held by req-a: req-b falls back to the one-shot vocode.
-    assert vocoder.one_shot_calls == [30]
-
     scheduler._on_done("req-a")
     assert scheduler._active_streams == 0
     _drain_outbox(scheduler)
+
+    # A denied stream never promotes, even after the slot frees: acquiring
+    # mid-utterance would turn it into a slow drip instead of a clean
+    # one-shot fallback.
+    scheduler._on_chunk("req-b", _chunk(list(range(130, 160)), chunk_id=1))
+    assert scheduler._active_streams == 0
+    scheduler._on_done("req-b")
+    assert vocoder.one_shot_calls == [30]
+    assert all(w[0][STREAM_SILENCE_PREFIX] < 100 for w in vocoder.stream_windows)
 
     # Slot free again: a new stream decodes live.
     pc = _payload(30, stream=True, request_id="req-c")
