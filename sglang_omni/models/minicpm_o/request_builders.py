@@ -689,11 +689,10 @@ def make_talker_scheduler_adapters(
 def make_talker_stream_output_builder(*, codec_eos_id: int):
     """Stream each generated codec token to code2wav as it is sampled.
 
-    Every speech request streams (vocoding overlaps talker generation); the
-    chunk metadata's ``stream`` flag tells code2wav whether the client asked
-    for incremental audio delivery. EOS never reaches the vocoder, matching
-    the result adapter's trailing-EOS strip, and empty-span requests suppress
-    their single throwaway step.
+    Only streaming requests emit — chunked vocoding costs roughly twice the
+    one-shot pass, so non-streaming requests keep the terminal-payload path.
+    EOS never reaches the vocoder, matching the result adapter's trailing-EOS
+    strip, and empty-span requests suppress their single throwaway step.
     """
 
     def _build_stream_output(
@@ -701,23 +700,25 @@ def make_talker_stream_output_builder(*, codec_eos_id: int):
     ) -> list[OutgoingMessage]:
         if req_output.data is None:
             return []
-        if req_data.talker_model_inputs.get("empty_span"):
-            return []
-        token_id = int(req_output.data)
-        if token_id < 0 or token_id >= int(codec_eos_id):
-            return []
         stage_payload = req_data.stage_payload
         is_streaming = bool(
             stage_payload is not None
             and (stage_payload.request.params or {}).get("stream", False)
         )
+        if not is_streaming:
+            return []
+        if req_data.talker_model_inputs.get("empty_span"):
+            return []
+        token_id = int(req_output.data)
+        if token_id < 0 or token_id >= int(codec_eos_id):
+            return []
         return [
             OutgoingMessage(
                 request_id=request_id,
                 type="stream",
                 data=torch.tensor([token_id], dtype=torch.long),
                 target=CODE2WAV_STAGE,
-                metadata={"stream": is_streaming, "modality": "audio_codes"},
+                metadata={"stream": True, "modality": "audio_codes"},
             )
         ]
 
