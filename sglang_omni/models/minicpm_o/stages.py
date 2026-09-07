@@ -616,23 +616,12 @@ def create_code2wav_executor(
     model_path: str,
     *,
     device: str | None = None,
-    max_concurrency: int = 1,
 ):
-    from sglang_omni.models.minicpm_o.components.code2wav import MiniCPMOCode2Wav
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
-    from sglang_omni.utils.device import resolve_device_spec
+    from sglang_omni.models.minicpm_o.components.code2wav_scheduler import (
+        create_code2wav_scheduler,
+    )
 
-    model = MiniCPMOCode2Wav(model_path, device=resolve_device_spec(device))
-
-    def _vocode(payload: StagePayload) -> StagePayload:
-        return _run_code2wav_payload(payload, model=model)
-
-    # Note (ruoyu): single-shot vocoding is ~300 ms per utterance and was
-    # fully serialized, so at c10 requests queued ~1.8 s for it. A second
-    # worker overlaps one request's host-side launch work with another's GPU
-    # time; batched/streamed vocoding (qwen3_omni Code2WavScheduler) is the
-    # follow-up.
-    return SimpleScheduler(_vocode, max_concurrency=max_concurrency)
+    return create_code2wav_scheduler(model_path, device=device)
 
 
 def create_decode_executor(model_path: str):

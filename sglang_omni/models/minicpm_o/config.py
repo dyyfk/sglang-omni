@@ -45,9 +45,6 @@ _ENV_DEFAULTS = {
 # template). SimpleScheduler runs N worker threads when max_concurrency > 1;
 # the HF processor is stateless, so the calls are re-entrant.
 PREPROCESSING_MAX_CONCURRENCY = 4
-# The single-shot vocoder is launch-bound; two workers overlap one request's
-# host-side work with another's GPU time on the shared stream.
-CODE2WAV_MAX_CONCURRENCY = 2
 
 
 def _preprocessing_stage(
@@ -160,22 +157,21 @@ def _talker_stage(*, gpu: int, process: str) -> StageConfig:
         factory=FactoryArgs(max_seq_len=4096),
         gpu=gpu,
         next="code2wav",
+        stream_to=["code2wav"],
         project_payload={
             "code2wav": f"{_PKG}.request_builders.project_talker_to_code2wav",
         },
     )
 
 
-def _code2wav_stage(
-    *, gpu: int, process: str, max_concurrency: int = CODE2WAV_MAX_CONCURRENCY
-) -> StageConfig:
+def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
     return StageConfig(
         name="code2wav",
         process=process,
         factory_path=f"{_PKG}.stages.create_code2wav_executor",
-        factory=FactoryArgs(max_concurrency=max_concurrency),
         gpu=gpu,
         terminal=True,
+        can_accept_stream_before_payload=True,
     )
 
 
@@ -231,8 +227,9 @@ class MiniCPMOPipelineConfig(PipelineConfig):
 
 class MiniCPMOSpeechPipelineConfig(MiniCPMOPipelineConfig):
     """Speech pipeline: text stages + talker (native sglang AR stage) +
-    code2wav (stepaudio2 Token2wav). Audio output arrives non-streaming, one
-    wav per request."""
+    code2wav (stepaudio2 Token2wav). The talker streams codec tokens to
+    code2wav, which vocodes 25-token chunks as they arrive; streaming clients
+    receive incremental audio chunks, non-streaming clients one full wav."""
 
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
         THINKER_STAGE: EngineStageConfig,

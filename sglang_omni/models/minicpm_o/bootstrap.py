@@ -27,6 +27,7 @@ def create_talker_scheduler(
 
     from sglang_omni.models.minicpm_o.request_builders import (
         make_talker_scheduler_adapters,
+        make_talker_stream_output_builder,
     )
     from sglang_omni.models.minicpm_o.talker_model_runner import (
         MiniCPMOTalkerModelRunner,
@@ -110,6 +111,9 @@ def create_talker_scheduler(
         model_runner=model_runner,
         request_builder=request_builder,
         result_adapter=result_adapter,
+        stream_output_builder=make_talker_stream_output_builder(
+            codec_eos_id=model.codec_eos_id
+        ),
     )
 
 

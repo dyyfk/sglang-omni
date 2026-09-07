@@ -6,7 +6,6 @@ from __future__ import annotations
 import pytest
 
 from sglang_omni.models.minicpm_o.config import (
-    CODE2WAV_MAX_CONCURRENCY,
     PREPROCESSING_MAX_CONCURRENCY,
     MiniCPMOPipelineConfig,
     MiniCPMOSpeechPipelineConfig,
@@ -63,5 +62,11 @@ def test_executor_concurrency_knobs_reach_the_factories():
         stages["preprocessing"].factory.max_concurrency == PREPROCESSING_MAX_CONCURRENCY
     )
     assert PREPROCESSING_MAX_CONCURRENCY > 1
-    assert stages["code2wav"].factory.max_concurrency == CODE2WAV_MAX_CONCURRENCY
-    assert CODE2WAV_MAX_CONCURRENCY > 1
+
+
+def test_talker_streams_codec_tokens_to_code2wav():
+    stages = {
+        s.name: s for s in MiniCPMOSpeechPipelineConfig(model_path="dummy").stages
+    }
+    assert stages["talker"].stream_to == ["code2wav"]
+    assert stages["code2wav"].can_accept_stream_before_payload is True
