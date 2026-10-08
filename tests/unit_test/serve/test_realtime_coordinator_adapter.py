@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Iterable
 from typing import Literal
 from unittest.mock import Mock
@@ -19,9 +20,11 @@ from sglang_omni.proto.session import (
     TimedChunk,
 )
 from sglang_omni.serve.realtime.adapters import CoordinatorAdapter
+from sglang_omni.serve.realtime.control import Failure
 from sglang_omni.serve.realtime.output import OutputEvent, TextDelta, TurnFailure
+from sglang_omni.serve.realtime.runtime import SessionRuntime
 from sglang_omni.serve.realtime.schema import SessionConfiguration
-from sglang_omni.serve.realtime.types import Unit
+from sglang_omni.serve.realtime.types import Capabilities, RuntimeLimits, Unit
 
 SAMPLE_RATE = 16000
 UNIT_SAMPLES = 320
@@ -236,3 +239,42 @@ async def test_context_exhaustion_without_pending_unit_preserves_code() -> None:
     assert isinstance(event, TurnFailure)
     assert event.code == "context_exhausted"
     assert "8192" in event.message
+
+
+class ContextExhaustedCoordinator(SessionCoordinator):
+    """Fails the output stream with context exhaustion on its first output."""
+
+    async def session_outputs(
+        self, session_identity: SessionIdentity
+    ) -> AsyncIterator[OutputChunk]:
+        await self.outputs.get()
+        raise RuntimeError("context_exhausted: thinker context length 8192 tokens")
+        yield
+
+
+async def collect_events(runtime: SessionRuntime) -> list[object]:
+    return [envelope.event async for envelope in runtime.outputs()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_pending_unit", [True, False])
+async def test_context_exhaustion_logs_one_warning_without_traceback(
+    caplog: pytest.LogCaptureFixture, has_pending_unit: bool
+) -> None:
+    coordinator = ContextExhaustedCoordinator([])
+    adapter = build_adapter(coordinator)
+    runtime = SessionRuntime("test", Capabilities(), lambda: adapter, RuntimeLimits())
+    await runtime.update({}, "update")
+    if has_pending_unit:
+        await runtime.append(b"\1\0" * UNIT_SAMPLES, 0, None, "append")
+    else:
+        coordinator.outputs.put_nowait(None)
+    events = await asyncio.wait_for(collect_events(runtime), PROCESS_TIMEOUT_S)
+
+    failures = [event for event in events if isinstance(event, Failure)]
+    assert [failure.code for failure in failures] == ["context_exhausted"]
+    records = [record for record in caplog.records if record.levelno >= logging.INFO]
+    assert [(record.levelno, record.exc_info) for record in records] == [
+        (logging.WARNING, None)
+    ]
+    assert "8192" in records[0].getMessage()

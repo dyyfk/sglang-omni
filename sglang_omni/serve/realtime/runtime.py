@@ -412,18 +412,29 @@ class SessionRuntime:
         except ProtocolError as exc:
             self.fail(str(exc), exc.code)
         except Exception as exc:
-            logger.exception(f"Realtime session {self.session_id} input pump failed")
             code = (
                 ContextExhaustedError.CODE
                 if ContextExhaustedError.matches(exc)
                 else "internal"
             )
+            if code == "internal":
+                logger.exception(
+                    f"Realtime session {self.session_id} input pump failed"
+                )
+            else:
+                pass
             self.fail(str(exc), code)
 
     def fail(
         self, message: str, code: str = "internal", event_id: str | None = None
     ) -> None:
         if self.close_task is None:
+            if code == ContextExhaustedError.CODE:
+                # Note (ruoyu): A long session filling the thinker context is an
+                # expected end, not a server fault, so no traceback.
+                logger.warning(f"Realtime session {self.session_id} closed: {message}")
+            else:
+                pass
             self.output_buffer.enqueue_terminal(
                 Failure(code, message[:MAX_FAILURE_MESSAGE_CHARS], True, event_id)
             )

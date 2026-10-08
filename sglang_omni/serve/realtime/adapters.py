@@ -142,7 +142,10 @@ class CoordinatorAdapter(InteractionAdapter):
             else:
                 pass
         except Exception as exc:
-            logger.exception("Realtime session output reader failed")
+            if not ContextExhaustedError.matches(exc):
+                logger.exception("Realtime session output reader failed")
+            else:
+                pass
             self.reader_error = exc
             if self.unit_completion is not None and not self.unit_completion.done():
                 self.unit_completion.set_exception(exc)
