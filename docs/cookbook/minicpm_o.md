@@ -52,25 +52,26 @@ print(message.audio.transcript or message.content)
 
 ```bash
 python -m sglang_omni.cli serve \
-  --config examples/full_duplex/minicpmo.yaml \
   --model-path openbmb/MiniCPM-o-4_5 \
+  --variant session \
   --enable-realtime --port 8000
 ```
 
-We provide two demonstrative config files.
+`--variant session` selects the full-duplex pipeline. The defaults below match the MiniCPM-o demo. Change any of them with a flag of the same name, for example `--max_sessions 4` or `--sampling.temperature 0.5`. To print the whole configuration:
 
-| Config | Use it for |
-|---|---|
-| `examples/full_duplex/minicpmo.yaml` | Normal serving. Sampling matches the MiniCPM-o demo |
-| `examples/full_duplex/minicpmo-parity.yaml` | Repeatable output for regression and parity recordings. Differs only in greedy sampling and `top_k: 100` |
+```bash
+sgl-omni config resolve --model-path openbmb/MiniCPM-o-4_5 --variant session
+```
+
+For repeatable output in regression and parity recordings, serve `--config examples/full_duplex/minicpmo-parity.yaml` instead. It differs from the defaults only in greedy sampling and `top_k: 100`.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `max_sessions` | 2 | Conversations at the same time. Further connections get HTTP 503 |
 | `reference_audio` | checkpoint default | Voice used when a session sends no reference |
 | `speech_state_bytes_per_session` | 2 GiB | Memory the speech stage may hold per conversation. A conversation that needs more is closed and the others keep running |
-| `sampling` | see the config | Default sampling when a session does not set its own |
-| `vision` | see the config | Camera-frame limits per unit (1 s of audio) |
+| `sampling` | printed by `config resolve` | Default sampling when a session does not set its own |
+| `vision` | printed by `config resolve` | Camera-frame limits per unit (1 s of audio) |
 
 A session holds at most 8192 tokens of history, which is the model's trained context length. When that fills, the server sends `context_exhausted` and closes the session.
 
@@ -118,7 +119,7 @@ Session settings go in the `sglang` field of `session.update`, before the first 
 | Setting | Field | Notes |
 |---|---|---|
 | Voice | `reference_audio` | `{"media_type": "audio/wav", "data": "<base64>"}`, a PCM16 WAV of at most 30 s and 1 MiB; `tts_reference_audio` changes only the output voice |
-| Sampling | `sampling` | For example `temperature`, `top_p` and `listen_prob_scale`; unset fields keep the defaults in `examples/full_duplex/minicpmo.yaml` |
+| Sampling | `sampling` | For example `temperature`, `top_p` and `listen_prob_scale`; unset fields keep the server's defaults |
 | Image detail | `max_slice_nums` | Higher is sharper but accepts fewer frames per second |
 
 Send camera frames with `sglang.input_image.append`: a base64 JPEG or PNG in `image`, and its position on the audio timeline in `sglang.t_ms`. By default up to 4 frames per second are accepted; `session.updated` reports the actual limit.

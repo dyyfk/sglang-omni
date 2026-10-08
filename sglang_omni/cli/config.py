@@ -33,6 +33,7 @@ config_app = typer.Typer(help="Inspect, resolve and export the pipeline configur
 _MODEL_PATH_HELP = "The Hugging Face model ID or the path to the model directory."
 _CONFIG_HELP = "Path to a pipeline config file, as accepted by `sgl-omni serve`."
 _TEXT_ONLY_HELP = "Use the thinker-only pipeline, as `sgl-omni serve --text-only` does."
+_VARIANT_HELP = "Use this pipeline variant, as `sgl-omni serve --variant` does."
 _MEM_FRACTION_HELP = (
     "Set engine.mem_fraction_static on every SGLang engine stage, as "
     "`sgl-omni serve --mem-fraction-static` does."
@@ -120,6 +121,7 @@ def resolve_sources(
     model_path: str | None,
     config_file: str | None,
     text_only: bool,
+    variant: str | None,
     mem_fraction_static: float | None,
     argv: list[str],
 ) -> Resolution:
@@ -136,6 +138,7 @@ def resolve_sources(
     from sglang_omni.cli.serve import (
         apply_tensor_parallel_engine_overrides,
         patches_from_broadcast_flags,
+        resolve_variant,
         tensor_parallel_engine_writes,
     )
 
@@ -143,6 +146,9 @@ def resolve_sources(
         raise typer.BadParameter("--model-path is required unless --config is set")
     else:
         pass
+    selected_variant = resolve_variant(
+        config=config_file, text_only=text_only, variant=variant
+    )
 
     try:
         if config_file:
@@ -157,7 +163,7 @@ def resolve_sources(
                 pass
         else:
             manager = ConfigManager.from_model_path(
-                str(model_path), variant="text" if text_only else None
+                str(model_path), variant=selected_variant
             )
             baseline, patches = manager.config, ConfigPatchSet()
 
@@ -220,6 +226,9 @@ def resolve(
     text_only: Annotated[
         bool, typer.Option("--text-only", help=_TEXT_ONLY_HELP)
     ] = False,
+    variant: Annotated[
+        str | None, typer.Option("--variant", help=_VARIANT_HELP)
+    ] = None,
     mem_fraction_static: Annotated[
         float | None, typer.Option("--mem-fraction-static", help=_MEM_FRACTION_HELP)
     ] = None,
@@ -246,6 +255,7 @@ def resolve(
         model_path=model_path,
         config_file=config,
         text_only=text_only,
+        variant=variant,
         mem_fraction_static=mem_fraction_static,
         argv=ctx.args,
     )
@@ -309,6 +319,9 @@ def explain(
     text_only: Annotated[
         bool, typer.Option("--text-only", help=_TEXT_ONLY_HELP)
     ] = False,
+    variant: Annotated[
+        str | None, typer.Option("--variant", help=_VARIANT_HELP)
+    ] = None,
     mem_fraction_static: Annotated[
         float | None, typer.Option("--mem-fraction-static", help=_MEM_FRACTION_HELP)
     ] = None,
@@ -322,6 +335,7 @@ def explain(
         model_path=model_path,
         config_file=config,
         text_only=text_only,
+        variant=variant,
         mem_fraction_static=mem_fraction_static,
         argv=ctx.args,
     )

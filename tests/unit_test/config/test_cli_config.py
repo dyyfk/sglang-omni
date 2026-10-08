@@ -576,3 +576,73 @@ class TestServeErrors:
         output = output_of(result)
         assert "Missing value" in output
         assert "Traceback" not in output
+
+
+class TestVariant:
+    """``--variant`` picks a pipeline from the model's ``Variants`` table."""
+
+    @pytest.fixture(autouse=True)
+    def minicpm_o(self):
+        module = pytest.importorskip("sglang_omni.models.minicpm_o.config")
+        with mock.patch(
+            "sglang_omni.config.manager.resolve_config_cls_for_model_path",
+            return_value=module.EntryClass,
+        ):
+            yield module
+
+    def test_resolve_uses_the_named_variant(self, runner, minicpm_o):
+        result = runner.invoke(
+            config_app, ["resolve", "--model-path", "dummy", "--variant", "session"]
+        )
+
+        assert result.exit_code == 0, output_of(result)
+        expected = minicpm_o.Variants["session"](model_path="dummy")
+        assert yaml.safe_load(result.stdout)["config_cls"] == expected.config_cls
+
+    def test_text_only_is_the_text_variant(self, runner):
+        args = ["resolve", "--model-path", "dummy"]
+        text_only = runner.invoke(config_app, [*args, "--text-only"])
+        variant = runner.invoke(config_app, [*args, "--variant", "text"])
+
+        assert text_only.exit_code == 0, output_of(text_only)
+        assert variant.stdout == text_only.stdout
+
+    def test_an_unknown_variant_lists_the_known_ones(self, runner):
+        result = runner.invoke(
+            config_app, ["resolve", "--model-path", "dummy", "--variant", "duplex"]
+        )
+
+        assert result.exit_code != 0
+        output = output_of(result)
+        assert "Available variants: session, speech, text" in output
+        assert "Traceback" not in output
+
+    def test_text_only_refuses_another_variant(self, runner):
+        result = runner.invoke(
+            config_app,
+            ["resolve", "--model-path", "dummy", "--text-only", "--variant", "session"],
+        )
+
+        assert result.exit_code != 0
+        assert "--text-only cannot be combined with --variant" in output_of(result)
+
+    def test_a_config_file_refuses_a_variant(self, runner, plain_config_file):
+        result = runner.invoke(
+            config_app,
+            ["resolve", "--config", str(plain_config_file), "--variant", "session"],
+        )
+
+        assert result.exit_code != 0
+        assert "--variant cannot be combined with --config" in output_of(result)
+
+    def test_serve_launches_the_named_variant(self, runner, minicpm_o):
+        from sglang_omni.cli import app
+
+        with mock.patch("sglang_omni.cli.serve.launch_server") as launch_server:
+            result = runner.invoke(
+                app, ["serve", "--model-path", "dummy", "--variant", "session"]
+            )
+
+        assert result.exit_code == 0, output_of(result)
+        launched = launch_server.call_args.args[0]
+        assert type(launched) is minicpm_o.Variants["session"]
