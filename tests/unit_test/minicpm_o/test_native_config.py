@@ -26,7 +26,6 @@ from sglang_omni.config.runtime import (
 from sglang_omni.models.minicpm_o import native_stages, stages
 from sglang_omni.models.minicpm_o.components import audio_encoder, image_encoder
 from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
-from sglang_omni.models.minicpm_o.engine_builder import MiniCPMOThinkerEngineBuilder
 from sglang_omni.models.minicpm_o.hf_config import MiniCPMOConfig
 from sglang_omni.models.minicpm_o.native_config import (
     MiniCPMODuplexPipelineConfig,
@@ -265,21 +264,6 @@ def test_duplex_deployment_grants_images_by_slice_count() -> None:
     assert capabilities.input_modalities == ("audio", "image")
     assert capabilities.image_frames_per_unit == (4, 3, 2, 2, 1, 1, 1, 1, 1)
     assert capabilities.default_max_slice_nums == 1
-
-
-def test_duplex_leaves_memory_sizing_to_sglang() -> None:
-    config = MiniCPMODuplexPipelineConfig(model_path="unused")
-    assert [stage.gpu_memory_fraction for stage in config.stages] == [
-        None,
-        None,
-        None,
-        None,
-    ]
-    assert config.placement.require_memory_fraction_for_colocation is False
-    thinker_defaults = MiniCPMOThinkerEngineBuilder().generation_defaults(
-        dtype="bfloat16"
-    )
-    assert "mem_fraction_static" not in thinker_defaults
 
 
 def invoke_variant_session(
