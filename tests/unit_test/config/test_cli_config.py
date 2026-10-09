@@ -15,16 +15,19 @@ disk, which these tests have no weights for.
 
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest import mock
 
 import pytest
 import yaml
+from pydantic import Field
 from typer.testing import CliRunner
 
 from sglang_omni.cli import app
 from sglang_omni.cli.config import config_app
 from sglang_omni.cli.serve import patches_from_broadcast_flags
 from sglang_omni.config.manager import ConfigManager
+from sglang_omni.config.schema import PipelineConfig, StageConfig
 from sglang_omni.config.sources import dump_user_config
 
 
@@ -579,87 +582,183 @@ class TestServeErrors:
         assert "Traceback" not in output
 
 
+RESOLVE_CONFIG_CLS_TARGET = (
+    "sglang_omni.config.manager.resolve_config_cls_for_model_path"
+)
+UNKNOWN_VARIANT = "nonexistent"
+
+
+def fake_stages() -> list[StageConfig]:
+    return [
+        StageConfig(
+            name="stage",
+            process="pipeline",
+            factory_path="tests.unit_test.fixtures.pipeline_fakes.dummy_factory",
+            terminal=True,
+        )
+    ]
+
+
+class FakeDefaultPipelineConfig(PipelineConfig):
+    """A model's default pipeline."""
+
+    stages: list[StageConfig] = Field(default_factory=fake_stages)
+
+
+class FakeTextPipelineConfig(FakeDefaultPipelineConfig):
+    """The model's text variant."""
+
+
+class FakeRealtimePipelineConfig(FakeDefaultPipelineConfig):
+    """A variant that serves only /v1/realtime."""
+
+    is_realtime_only: ClassVar[bool] = True
+    realtime_only_setting: int = 7
+
+
+# note (ruoyu): --variant reads the Variants table of the module that defines
+# the model's config class, which is this module for the fakes above.
+Variants = {"text": FakeTextPipelineConfig, "realtime": FakeRealtimePipelineConfig}
+
+
 class TestVariant:
     """--variant picks a pipeline from the model's Variants table."""
 
     @pytest.fixture(autouse=True)
-    def minicpm_o(self):
-        module = pytest.importorskip("sglang_omni.models.minicpm_o.config")
+    def fake_model(self):
         with mock.patch(
-            "sglang_omni.config.manager.resolve_config_cls_for_model_path",
-            return_value=module.EntryClass,
+            RESOLVE_CONFIG_CLS_TARGET, return_value=FakeDefaultPipelineConfig
         ):
-            yield module
+            yield
 
-    def test_resolve_uses_the_named_variant(self, runner, minicpm_o):
+    def test_resolve_uses_the_named_variant(self, runner):
         result = runner.invoke(
-            config_app, ["resolve", "--model-path", "dummy", "--variant", "session"]
+            config_app, ["resolve", "--model-path", "dummy", "--variant", "realtime"]
         )
 
         assert result.exit_code == 0, output_of(result)
-        expected = minicpm_o.Variants["session"](model_path="dummy")
-        assert yaml.safe_load(result.stdout)["config_cls"] == expected.config_cls
-
-    def test_text_only_is_the_text_variant(self, runner):
-        args = ["resolve", "--model-path", "dummy"]
-        text_only = runner.invoke(config_app, [*args, "--text-only"])
-        variant = runner.invoke(config_app, [*args, "--variant", "text"])
-
-        assert text_only.exit_code == 0, output_of(text_only)
-        assert variant.stdout == text_only.stdout
-
-    def test_an_unknown_variant_lists_the_known_ones(self, runner):
-        result = runner.invoke(
-            config_app, ["resolve", "--model-path", "dummy", "--variant", "duplex"]
+        assert (
+            yaml.safe_load(result.stdout)["config_cls"] == "FakeRealtimePipelineConfig"
         )
 
-        assert result.exit_code != 0
+    def test_explain_reads_the_named_variant(self, runner):
+        result = runner.invoke(
+            config_app,
+            [
+                "explain",
+                "realtime_only_setting",
+                "--model-path",
+                "dummy",
+                "--variant",
+                "realtime",
+            ],
+        )
+
+        assert result.exit_code == 0, output_of(result)
+        assert "realtime_only_setting = 7" in result.stdout
+
+    def test_variant_text_matches_text_only(self, runner):
+        resolve_arguments = ["resolve", "--model-path", "dummy"]
+        text_only = runner.invoke(config_app, [*resolve_arguments, "--text-only"])
+        text_variant = runner.invoke(
+            config_app, [*resolve_arguments, "--variant", "text"]
+        )
+
+        assert text_variant.exit_code == 0, output_of(text_variant)
+        assert (
+            yaml.safe_load(text_variant.stdout)["config_cls"]
+            == "FakeTextPipelineConfig"
+        )
+        assert text_variant.stdout == text_only.stdout
+
+    @pytest.mark.parametrize(
+        ("config_cls", "available_variants"),
+        [
+            (FakeDefaultPipelineConfig, "Available variants: realtime, text"),
+            (PipelineConfig, "Available variants: none"),
+        ],
+    )
+    def test_an_unknown_variant_lists_the_known_ones(
+        self, config_cls, available_variants
+    ):
+        with mock.patch(RESOLVE_CONFIG_CLS_TARGET, return_value=config_cls):
+            with pytest.raises(ValueError, match=available_variants):
+                ConfigManager.from_model_path("dummy", variant=UNKNOWN_VARIANT)
+
+    @pytest.mark.parametrize(
+        ("cli_app", "command"), [(config_app, "resolve"), (app, "serve")]
+    )
+    def test_an_unknown_variant_is_refused_without_a_traceback(
+        self, runner, cli_app, command
+    ):
+        with mock.patch("sglang_omni.cli.serve.launch_server") as launch_server:
+            result = runner.invoke(
+                cli_app,
+                [command, "--model-path", "dummy", "--variant", UNKNOWN_VARIANT],
+            )
+
+        assert result.exit_code == 2
         output = output_of(result)
-        assert "Available variants: session, speech, text" in output
+        assert UNKNOWN_VARIANT in output
         assert "Traceback" not in output
+        launch_server.assert_not_called()
 
     def test_text_only_refuses_another_variant(self, runner):
         result = runner.invoke(
             config_app,
-            ["resolve", "--model-path", "dummy", "--text-only", "--variant", "session"],
+            [
+                "resolve",
+                "--model-path",
+                "dummy",
+                "--text-only",
+                "--variant",
+                "realtime",
+            ],
         )
 
-        assert result.exit_code != 0
-        assert "--text-only cannot be combined with --variant" in output_of(result)
+        assert result.exit_code == 2
+        output = output_of(result)
+        assert "--text-only" in output
+        assert "--variant" in output
 
     def test_a_config_file_refuses_a_variant(self, runner, plain_config_file):
         result = runner.invoke(
             config_app,
-            ["resolve", "--config", str(plain_config_file), "--variant", "session"],
+            ["resolve", "--config", str(plain_config_file), "--variant", "text"],
         )
 
-        assert result.exit_code != 0
-        assert "--variant cannot be combined with --config" in output_of(result)
+        assert result.exit_code == 2
+        output = output_of(result)
+        assert "--config" in output
+        assert "--variant" in output
 
-    def test_serve_launches_the_named_variant(self, runner, minicpm_o):
+    @pytest.mark.parametrize(
+        ("serve_arguments", "launched_config_cls"),
+        [
+            (["--variant", "text"], FakeTextPipelineConfig),
+            (
+                ["--variant", "realtime", "--enable-realtime"],
+                FakeRealtimePipelineConfig,
+            ),
+        ],
+    )
+    def test_serve_launches_the_named_variant(
+        self, runner, serve_arguments, launched_config_cls
+    ):
         with mock.patch("sglang_omni.cli.serve.launch_server") as launch_server:
             result = runner.invoke(
-                app,
-                [
-                    "serve",
-                    "--model-path",
-                    "dummy",
-                    "--variant",
-                    "session",
-                    "--enable-realtime",
-                ],
+                app, ["serve", "--model-path", "dummy", *serve_arguments]
             )
 
         assert result.exit_code == 0, output_of(result)
-        launched = launch_server.call_args.args[0]
-        assert type(launched) is minicpm_o.Variants["session"]
+        assert type(launch_server.call_args.args[0]) is launched_config_cls
 
-    def test_a_realtime_only_variant_requires_enable_realtime(self, runner):
+    def test_a_realtime_only_pipeline_requires_enable_realtime(self, runner):
         with mock.patch("sglang_omni.cli.serve.launch_server") as launch_server:
             result = runner.invoke(
-                app, ["serve", "--model-path", "dummy", "--variant", "session"]
+                app, ["serve", "--model-path", "dummy", "--variant", "realtime"]
             )
 
-        assert result.exit_code != 0
+        assert result.exit_code == 2
         assert "--enable-realtime" in output_of(result)
         launch_server.assert_not_called()

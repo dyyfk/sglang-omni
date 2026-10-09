@@ -11,10 +11,13 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from click.testing import Result
 from pydantic import ValidationError
 from transformers import AutoConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+from typer.testing import CliRunner
 
+from sglang_omni.cli import app
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import (
     apply_typed_stage_kwargs,
@@ -22,6 +25,8 @@ from sglang_omni.config.runtime import (
 )
 from sglang_omni.models.minicpm_o import native_stages, stages
 from sglang_omni.models.minicpm_o.components import audio_encoder, image_encoder
+from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
+from sglang_omni.models.minicpm_o.engine_builder import MiniCPMOThinkerEngineBuilder
 from sglang_omni.models.minicpm_o.hf_config import MiniCPMOConfig
 from sglang_omni.models.minicpm_o.native_config import (
     MiniCPMODuplexPipelineConfig,
@@ -260,3 +265,51 @@ def test_duplex_deployment_grants_images_by_slice_count() -> None:
     assert capabilities.input_modalities == ("audio", "image")
     assert capabilities.image_frames_per_unit == (4, 3, 2, 2, 1, 1, 1, 1, 1)
     assert capabilities.default_max_slice_nums == 1
+
+
+def test_duplex_leaves_memory_sizing_to_sglang() -> None:
+    config = MiniCPMODuplexPipelineConfig(model_path="unused")
+    assert [stage.gpu_memory_fraction for stage in config.stages] == [
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert config.placement.require_memory_fraction_for_colocation is False
+    thinker_defaults = MiniCPMOThinkerEngineBuilder().generation_defaults(
+        dtype="bfloat16"
+    )
+    assert "mem_fraction_static" not in thinker_defaults
+
+
+def invoke_variant_session(
+    monkeypatch: pytest.MonkeyPatch, serve_arguments: list[str]
+) -> tuple[Result, Mock]:
+    monkeypatch.setattr(
+        "sglang_omni.config.manager.resolve_config_cls_for_model_path",
+        lambda model_path: MiniCPMOSpeechPipelineConfig,
+    )
+    launch_server = Mock()
+    monkeypatch.setattr("sglang_omni.cli.serve.launch_server", launch_server)
+    result = CliRunner(env={"NO_COLOR": "1", "TERM": "dumb"}).invoke(
+        app,
+        ["serve", "--model-path", "unused", "--variant", "session", *serve_arguments],
+    )
+    return result, launch_server
+
+
+def test_variant_session_serves_duplex(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, launch_server = invoke_variant_session(monkeypatch, ["--enable-realtime"])
+
+    assert result.exit_code == 0, result.output
+    assert type(launch_server.call_args.args[0]) is MiniCPMODuplexPipelineConfig
+
+
+def test_variant_session_requires_enable_realtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, launch_server = invoke_variant_session(monkeypatch, [])
+
+    assert result.exit_code == 2
+    assert "--enable-realtime" in result.output
+    launch_server.assert_not_called()
