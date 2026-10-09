@@ -334,18 +334,29 @@ def test_thinker_kv_pool_holds_the_derived_tokens_within_its_card_share(
 
 
 @pytest.mark.parametrize(
-    ("config_name", "disable_cuda_graph"),
-    [("minicpmo.yaml", False), ("minicpmo-parity.yaml", True)],
+    ("cli_flags", "disable_cuda_graph"),
+    [
+        ([], False),
+        (
+            [
+                "--thinker.engine.disable_cuda_graph",
+                "true",
+                "--talker.engine.disable_cuda_graph",
+                "true",
+            ],
+            True,
+        ),
+    ],
 )
-def test_shipped_duplex_configs_select_decode_graphs_without_compile(
-    config_name: str, disable_cuda_graph: bool, monkeypatch: pytest.MonkeyPatch
+def test_duplex_settings_select_decode_graphs_without_compile(
+    cli_flags: list[str], disable_cuda_graph: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mapping = dict(
         CONFIG_MAPPING._extra_content
     )  # noqa: leading-underscore  # upstream name
     monkeypatch.setattr(CONFIG_MAPPING, "_extra_content", mapping)
-    examples = Path(__file__).parents[3] / "examples" / "full_duplex"
-    config = ConfigManager.from_file(str(examples / config_name)).config
+    manager = ConfigManager(MiniCPMODuplexPipelineConfig(model_path="unused"))
+    config = manager.merge_config(manager.parse_extra_args(cli_flags))
     talker_server_args: dict[str, JsonValue] = {}
 
     def capture_server_args(model_path: str, **server_args: JsonValue) -> None:
