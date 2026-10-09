@@ -8,6 +8,12 @@ from typing import Annotated, NamedTuple, Optional
 import typer
 import yaml
 
+from sglang_omni.cli.serve import (
+    apply_tensor_parallel_engine_overrides,
+    patches_from_broadcast_flags,
+    resolve_variant,
+    tensor_parallel_engine_writes,
+)
 from sglang_omni.config.compat import canonicalize_dotted_key
 from sglang_omni.config.manager import ConfigManager, resolve_config_cls_for_model_path
 from sglang_omni.config.patch import (
@@ -132,16 +138,6 @@ def resolve_sources(
     difference is that a launch throws the provenance away and this keeps it,
     which is what lets these commands answer *which source set this value*.
     """
-    # Local import: serve owns the broadcast flag's fan-out and the TP
-    # derivation; importing them here keeps the two commands building
-    # identical configurations.
-    from sglang_omni.cli.serve import (
-        apply_tensor_parallel_engine_overrides,
-        patches_from_broadcast_flags,
-        resolve_variant,
-        tensor_parallel_engine_writes,
-    )
-
     if config_file is None and model_path is None:
         raise typer.BadParameter("--model-path is required unless --config is set")
     else:

@@ -5,8 +5,7 @@ Run these commands from the repository root after installing `sglang-omni`.
 ## Full-duplex audio
 
 MiniCPM-o launch commands, server settings, and the realtime protocol are in the
-[MiniCPM-o cookbook](../docs/cookbook/minicpm_o.md). The config for parity
-recordings is `full_duplex/minicpmo-parity.yaml`.
+[MiniCPM-o cookbook](../docs/cookbook/minicpm_o.md).
 
 ## Unified Launcher
 

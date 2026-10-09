@@ -63,7 +63,7 @@ python -m sglang_omni.cli serve \
 sgl-omni config resolve --model-path openbmb/MiniCPM-o-4_5 --variant session
 ```
 
-For repeatable output in regression and parity recordings, serve `--config examples/full_duplex/minicpmo-parity.yaml` instead. It differs from the defaults only in greedy sampling and `top_k: 100`.
+For repeatable output in regression and parity recordings, add `--sampling.greedy true --sampling.top_k 100`.
 
 | Setting | Default | Meaning |
 |---|---|---|

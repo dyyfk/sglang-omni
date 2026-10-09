@@ -21,6 +21,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from sglang_omni.cli import app
 from sglang_omni.cli.config import config_app
 from sglang_omni.cli.serve import patches_from_broadcast_flags
 from sglang_omni.config.manager import ConfigManager
@@ -579,7 +580,7 @@ class TestServeErrors:
 
 
 class TestVariant:
-    """``--variant`` picks a pipeline from the model's ``Variants`` table."""
+    """--variant picks a pipeline from the model's Variants table."""
 
     @pytest.fixture(autouse=True)
     def minicpm_o(self):
@@ -636,13 +637,29 @@ class TestVariant:
         assert "--variant cannot be combined with --config" in output_of(result)
 
     def test_serve_launches_the_named_variant(self, runner, minicpm_o):
-        from sglang_omni.cli import app
-
         with mock.patch("sglang_omni.cli.serve.launch_server") as launch_server:
             result = runner.invoke(
-                app, ["serve", "--model-path", "dummy", "--variant", "session"]
+                app,
+                [
+                    "serve",
+                    "--model-path",
+                    "dummy",
+                    "--variant",
+                    "session",
+                    "--enable-realtime",
+                ],
             )
 
         assert result.exit_code == 0, output_of(result)
         launched = launch_server.call_args.args[0]
         assert type(launched) is minicpm_o.Variants["session"]
+
+    def test_a_realtime_only_variant_requires_enable_realtime(self, runner):
+        with mock.patch("sglang_omni.cli.serve.launch_server") as launch_server:
+            result = runner.invoke(
+                app, ["serve", "--model-path", "dummy", "--variant", "session"]
+            )
+
+        assert result.exit_code != 0
+        assert "--enable-realtime" in output_of(result)
+        launch_server.assert_not_called()
