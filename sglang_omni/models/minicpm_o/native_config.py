@@ -10,7 +10,6 @@ from sglang_omni.config import (
     EngineArgs,
     EngineStageConfig,
     PipelineConfig,
-    PlacementConfig,
     StageConfig,
 )
 
@@ -25,6 +24,7 @@ def stages() -> list[StageConfig]:
             name="perception",
             process="perception",
             gpu=0,
+            gpu_memory_fraction=0.12,
             factory_path=f"{PKG}.create_perception_scheduler",
             next="thinker",
         ),
@@ -32,6 +32,7 @@ def stages() -> list[StageConfig]:
             name="thinker",
             process="thinker",
             gpu=0,
+            gpu_memory_fraction=0.52,
             factory_path=f"{PKG}.create_thinker_scheduler",
             next="talker",
             engine=EngineArgs(disable_cuda_graph=True),
@@ -40,6 +41,7 @@ def stages() -> list[StageConfig]:
             name="talker",
             process="talker",
             gpu=0,
+            gpu_memory_fraction=0.15,
             factory_path="sglang_omni.models.minicpm_o.stages.create_sglang_session_talker_executor_from_config",
             next="speech",
             engine=EngineArgs(disable_cuda_graph=True),
@@ -48,6 +50,7 @@ def stages() -> list[StageConfig]:
             name="speech",
             process="speech",
             gpu=0,
+            gpu_memory_fraction=0.15,
             factory_path=f"{PKG}.create_speech_scheduler",
             terminal=True,
         ),
@@ -110,12 +113,6 @@ class MiniCPMODuplexPipelineConfig(PipelineConfig):
     vision: MiniCPMODuplexVision = Field(default_factory=MiniCPMODuplexVision)
     entry_stage: str = "perception"
     stages: list[StageConfig] = Field(default_factory=stages)
-    # note (ruoyu): SGLang sizes each engine from the card, as in the speech pipeline.
-    placement: PlacementConfig = Field(
-        default_factory=lambda: PlacementConfig(
-            require_memory_fraction_for_colocation=False
-        )
-    )
 
     realtime_deployment_factory: ClassVar[str] = (
         "sglang_omni.models.minicpm_o.session_adapters.build_realtime_deployment"
