@@ -39,7 +39,7 @@ config_app = typer.Typer(help="Inspect, resolve and export the pipeline configur
 _MODEL_PATH_HELP = "The Hugging Face model ID or the path to the model directory."
 _CONFIG_HELP = "Path to a pipeline config file, as accepted by `sgl-omni serve`."
 _TEXT_ONLY_HELP = "Use the thinker-only pipeline, as `sgl-omni serve --text-only` does."
-_VARIANT_HELP = "Use this pipeline variant, as `sgl-omni serve --variant` does."
+VARIANT_HELP = "Use this pipeline variant, as `sgl-omni serve --variant` does."
 _MEM_FRACTION_HELP = (
     "Set engine.mem_fraction_static on every SGLang engine stage, as "
     "`sgl-omni serve --mem-fraction-static` does."
@@ -222,9 +222,7 @@ def resolve(
     text_only: Annotated[
         bool, typer.Option("--text-only", help=_TEXT_ONLY_HELP)
     ] = False,
-    variant: Annotated[
-        str | None, typer.Option("--variant", help=_VARIANT_HELP)
-    ] = None,
+    variant: Annotated[str | None, typer.Option("--variant", help=VARIANT_HELP)] = None,
     mem_fraction_static: Annotated[
         float | None, typer.Option("--mem-fraction-static", help=_MEM_FRACTION_HELP)
     ] = None,
@@ -315,9 +313,7 @@ def explain(
     text_only: Annotated[
         bool, typer.Option("--text-only", help=_TEXT_ONLY_HELP)
     ] = False,
-    variant: Annotated[
-        str | None, typer.Option("--variant", help=_VARIANT_HELP)
-    ] = None,
+    variant: Annotated[str | None, typer.Option("--variant", help=VARIANT_HELP)] = None,
     mem_fraction_static: Annotated[
         float | None, typer.Option("--mem-fraction-static", help=_MEM_FRACTION_HELP)
     ] = None,
