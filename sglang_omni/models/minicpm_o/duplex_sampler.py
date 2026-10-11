@@ -81,7 +81,7 @@ def duplex_sample_batch(
     """Apply the two-stage unit sampler to every row with two host transfers per step."""
     device = logits.device
     token_ids: list[int | None] = [None] * len(thinker_states)
-    candidate_rows: list[int] = []
+    undecided_rows: list[int] = []
     for row, thinker_state in enumerate(thinker_states):
         sampling = thinker_state.sampling
         if generation_steps[row] >= sampling.max_new_tokens_per_unit - 1:
@@ -89,53 +89,56 @@ def duplex_sample_batch(
         elif generation_steps[row] == 0 and listen_forced_flags[row]:
             token_ids[row] = special_tokens.listen
         else:
-            candidate_rows.append(row)
-    if not candidate_rows:
+            undecided_rows.append(row)
+    if not undecided_rows:
         return token_ids
     else:
         pass
 
-    candidate_logits = logits[
-        torch.tensor(candidate_rows, dtype=torch.long, device=device)
+    undecided_logits = logits[
+        torch.tensor(undecided_rows, dtype=torch.long, device=device)
     ].float()
     # note (Junnan Li): The first sample must use the unscaled model distribution.
     first_token_ids = sample_rows(
-        candidate_logits,
-        [thinker_states[row].sampling.greedy for row in candidate_rows],
+        undecided_logits,
+        [thinker_states[row].sampling.greedy for row in undecided_rows],
     ).tolist()
-    second_positions: list[int] = []
-    for position, row in enumerate(candidate_rows):
-        if first_token_ids[position] == special_tokens.chunk_eos:
+    second_stage_positions: list[int] = []
+    for candidate_position, row in enumerate(undecided_rows):
+        if first_token_ids[candidate_position] == special_tokens.chunk_eos:
             token_ids[row] = special_tokens.chunk_eos
         else:
-            second_positions.append(position)
-    if not second_positions:
+            second_stage_positions.append(candidate_position)
+    if not second_stage_positions:
         return token_ids
     else:
         pass
 
-    second_states = [
-        thinker_states[candidate_rows[position]] for position in second_positions
+    second_stage_states = [
+        thinker_states[undecided_rows[candidate_position]]
+        for candidate_position in second_stage_positions
     ]
-    second_logits = candidate_logits[
-        torch.tensor(second_positions, dtype=torch.long, device=device)
+    second_stage_logits = undecided_logits[
+        torch.tensor(second_stage_positions, dtype=torch.long, device=device)
     ]
-    second_logits[:, forbidden_token_index] = -torch.inf
-    apply_repetition_penalty(second_logits, second_states)
+    second_stage_logits[:, forbidden_token_index] = -torch.inf
+    apply_repetition_penalty(second_stage_logits, second_stage_states)
 
-    listen_scales = [state.sampling.listen_prob_scale for state in second_states]
+    listen_scales = [state.sampling.listen_prob_scale for state in second_stage_states]
     if any(scale != 1.0 for scale in listen_scales):
-        second_logits[:, special_tokens.listen] *= torch.tensor(
+        second_stage_logits[:, special_tokens.listen] *= torch.tensor(
             listen_scales, dtype=torch.float32, device=device
         )
     else:
         pass
 
-    candidate_token_ids = sample_candidates(second_logits, second_states).tolist()
-    for position, candidate_token_id in zip(
-        second_positions, candidate_token_ids, strict=True
+    candidate_token_ids = sample_candidates(
+        second_stage_logits, second_stage_states
+    ).tolist()
+    for candidate_position, candidate_token_id in zip(
+        second_stage_positions, candidate_token_ids, strict=True
     ):
-        thinker_state = thinker_states[candidate_rows[position]]
+        thinker_state = thinker_states[undecided_rows[candidate_position]]
         sampling = thinker_state.sampling
         # note (Junnan Li): History retains controls before the mid-turn listen rewrite.
         history = thinker_state.generated_history
@@ -154,7 +157,7 @@ def duplex_sample_batch(
             thinker_state.is_turn_ended = False
         else:
             pass
-        token_ids[candidate_rows[position]] = candidate_token_id
+        token_ids[undecided_rows[candidate_position]] = candidate_token_id
     return token_ids
 
 
@@ -162,33 +165,38 @@ def apply_repetition_penalty(
     logits: torch.Tensor, thinker_states: list[MiniCPMOThinkerSessionState]
 ) -> None:
     """Divide each row's recently generated token logits by that session's penalty, in place."""
-    windows: list[list[int]] = []
+    penalty_windows: list[list[int]] = []
     for thinker_state in thinker_states:
         sampling = thinker_state.sampling
         history = thinker_state.generated_history
         if sampling.repetition_penalty != 1.0 and history:
-            windows.append(sorted(set(history[-sampling.repetition_window_size :])))
+            penalty_windows.append(
+                sorted(set(history[-sampling.repetition_window_size :]))
+            )
         else:
-            windows.append([])
-    width = max(len(window) for window in windows)
-    if width == 0:
+            penalty_windows.append([])
+    window_width = max(len(window) for window in penalty_windows)
+    if window_width == 0:
         return
     else:
         pass
     vocab_size = logits.shape[-1]
-    # note (Junnan Li): Matches the checkpoint sampler, which ignores the logit sign.
     penalties = torch.tensor(
         [[state.sampling.repetition_penalty] for state in thinker_states],
         dtype=torch.float32,
         device=logits.device,
     )
-    # A spare vocabulary column absorbs the padding of shorter windows.
+    # note (ruoyu): A spare vocabulary column absorbs the padding of shorter windows.
     padded_index = torch.tensor(
-        [window + [vocab_size] * (width - len(window)) for window in windows],
+        [
+            window + [vocab_size] * (window_width - len(window))
+            for window in penalty_windows
+        ],
         dtype=torch.long,
         device=logits.device,
     )
     widened_logits = torch.cat([logits, logits.new_zeros(logits.shape[0], 1)], dim=-1)
+    # note (Junnan Li): Matches the checkpoint sampler, which ignores the logit sign.
     widened_logits.scatter_(
         -1, padded_index, widened_logits.gather(-1, padded_index) / penalties
     )
@@ -209,8 +217,8 @@ def sample_candidates(
             sampled_groups.setdefault(
                 (sampling.temperature, sampling.top_k, sampling.top_p), []
             ).append(row)
-    for (temperature, top_k, top_p), rows in sampled_groups.items():
-        row_index = torch.tensor(rows, dtype=torch.long, device=logits.device)
+    for (temperature, top_k, top_p), group_rows in sampled_groups.items():
+        row_index = torch.tensor(group_rows, dtype=torch.long, device=logits.device)
         filtered_logits = filter_top_k_top_p(
             logits[row_index] / temperature, top_k=top_k, top_p=top_p
         )
