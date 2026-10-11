@@ -29,7 +29,7 @@ def filter_top_k_top_p(
     filtered_logits = logits.clone()
     if 0 < top_k < filtered_logits.shape[-1]:
         thresholds = torch.topk(filtered_logits, top_k, dim=-1).values[:, -1:]
-        filtered_logits[filtered_logits < thresholds] = -torch.inf
+        filtered_logits.masked_fill_(filtered_logits < thresholds, -torch.inf)
     else:
         pass
     if 0.0 < top_p < 1.0:
@@ -50,12 +50,21 @@ def filter_top_k_top_p(
     return filtered_logits
 
 
+def draw_token_ids(logits: torch.Tensor) -> torch.Tensor:
+    """One categorical draw per row from softmax(logits), with no device sync."""
+    probabilities = F.softmax(logits, dim=-1)
+    # note (ruoyu): The argmax of probability over an exponential draw is a categorical sample; torch.multinomial syncs twice per call.
+    return torch.argmax(
+        probabilities / torch.empty_like(probabilities).exponential_(), dim=-1
+    )
+
+
 def sample_rows(logits: torch.Tensor, greedy_flags: list[bool]) -> torch.Tensor:
     """One token id per row: the argmax for greedy rows, a softmax draw for the rest."""
     if all(greedy_flags):
         return torch.argmax(logits, dim=-1)
     elif not any(greedy_flags):
-        return torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
+        return draw_token_ids(logits)
     else:
         token_ids = torch.argmax(logits, dim=-1)
         sampled_rows = torch.tensor(
@@ -63,9 +72,7 @@ def sample_rows(logits: torch.Tensor, greedy_flags: list[bool]) -> torch.Tensor:
             dtype=torch.long,
             device=logits.device,
         )
-        token_ids[sampled_rows] = torch.multinomial(
-            F.softmax(logits[sampled_rows], dim=-1), 1
-        ).squeeze(-1)
+        token_ids[sampled_rows] = draw_token_ids(logits[sampled_rows])
         return token_ids
 
 
@@ -78,20 +85,20 @@ def duplex_sample_batch(
     generation_steps: list[int],
     listen_forced_flags: list[bool],
 ) -> list[int]:
-    """Apply the two-stage unit sampler to every row with two host transfers per step."""
+    """Apply the two-stage unit sampler to every row with two token-id transfers per step."""
     device = logits.device
-    token_ids: list[int | None] = [None] * len(thinker_states)
+    decided_token_ids: dict[int, int] = {}
     undecided_rows: list[int] = []
     for row, thinker_state in enumerate(thinker_states):
         sampling = thinker_state.sampling
         if generation_steps[row] >= sampling.max_new_tokens_per_unit - 1:
-            token_ids[row] = special_tokens.chunk_eos
+            decided_token_ids[row] = special_tokens.chunk_eos
         elif generation_steps[row] == 0 and listen_forced_flags[row]:
-            token_ids[row] = special_tokens.listen
+            decided_token_ids[row] = special_tokens.listen
         else:
             undecided_rows.append(row)
     if not undecided_rows:
-        return token_ids
+        return [decided_token_ids[row] for row in range(len(thinker_states))]
     else:
         pass
 
@@ -106,11 +113,11 @@ def duplex_sample_batch(
     second_stage_positions: list[int] = []
     for candidate_position, row in enumerate(undecided_rows):
         if first_token_ids[candidate_position] == special_tokens.chunk_eos:
-            token_ids[row] = special_tokens.chunk_eos
+            decided_token_ids[row] = special_tokens.chunk_eos
         else:
             second_stage_positions.append(candidate_position)
     if not second_stage_positions:
-        return token_ids
+        return [decided_token_ids[row] for row in range(len(thinker_states))]
     else:
         pass
 
@@ -157,8 +164,8 @@ def duplex_sample_batch(
             thinker_state.is_turn_ended = False
         else:
             pass
-        token_ids[undecided_rows[candidate_position]] = candidate_token_id
-    return token_ids
+        decided_token_ids[undecided_rows[candidate_position]] = candidate_token_id
+    return [decided_token_ids[row] for row in range(len(thinker_states))]
 
 
 def apply_repetition_penalty(
@@ -222,7 +229,5 @@ def sample_candidates(
         filtered_logits = filter_top_k_top_p(
             logits[row_index] / temperature, top_k=top_k, top_p=top_p
         )
-        token_ids[row_index] = torch.multinomial(
-            F.softmax(filtered_logits, dim=-1), 1
-        ).squeeze(-1)
+        token_ids[row_index] = draw_token_ids(filtered_logits)
     return token_ids
