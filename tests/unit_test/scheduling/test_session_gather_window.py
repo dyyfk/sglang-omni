@@ -8,6 +8,7 @@ import time
 import pytest
 
 from sglang_omni.proto import StagePayload
+from sglang_omni.proto.session import TimedChunk
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.session import SessionAppend, SessionScheduler
 from tests.unit_test.scheduling.test_session_batch import (
@@ -23,6 +24,13 @@ HOOK_SECONDS = 0.01
 
 class WindowHooks(RecordingHooks):
     gather_window_ms = WINDOW_SECONDS * 1000
+
+
+class IdleSessionHooks(WindowHooks):
+    """Appends of session a carry no work, so waiting for peers cannot batch them."""
+
+    def gathers_peers(self, payload: StagePayload, chunk: TimedChunk) -> bool:
+        return not payload.request_id.startswith("a")
 
 
 class ScriptedInbox:
@@ -123,6 +131,8 @@ def run_batches(
         (WindowHooks, "ab", [("a0", 0), ("b0", 0.005)], [["a0", "b0"]], 1),
         (SequentialHooks, "ab", [("a0", 0), ("b0", 0.005)], [["a0"], ["b0"]], 0),
         (RecordingHooks, "ab", [("a0", 0), ("b0", 0.005)], [["a0"], ["b0"]], 0),
+        (IdleSessionHooks, "ab", [("a0", 0), ("b0", 0.005)], [["a0"], ["b0"]], 1),
+        (IdleSessionHooks, "ab", [("b0", 0), ("a0", 0.005)], [["b0", "a0"]], 1),
     ],
     ids=[
         "appends-inside-the-window-share-one-call",
@@ -132,6 +142,8 @@ def run_batches(
         "wait-ends-once-every-open-session-has-an-append",
         "unbatched-hooks-never-wait",
         "zero-window-never-waits",
+        "appends-without-work-are-not-held",
+        "an-append-with-work-still-gathers-idle-peers",
     ],
 )
 def test_idle_stage_gathers_appends_within_the_window(
