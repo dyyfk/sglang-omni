@@ -123,6 +123,10 @@ class BatchedSessionHooks(SessionHooks):
         """Run one unit for each of several distinct sessions, in order."""
         raise NotImplementedError
 
+    def gathers_peers(self, payload: StagePayload, chunk: TimedChunk) -> bool:
+        """Whether waiting for other sessions' appends can batch this one's work."""
+        return True
+
 
 @dataclass(kw_only=True)
 class StageSession:
@@ -362,6 +366,8 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         batch = super().collect_batch(first_msg)
         if self.gather_window_seconds == 0 or self.is_backlogged:
             return batch
+        elif not any(self.gathers_peers(message) for message in batch):
+            return batch
         else:
             pass
         deadline = time.monotonic() + self.gather_window_seconds
@@ -397,6 +403,20 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             else:
                 self.pending_messages.append(message)
         return batch
+
+    def gathers_peers(self, message: IncomingMessage) -> bool:
+        """Whether holding the batch for more appends can batch this message's work."""
+        session_operation = SessionOperation.from_dict(
+            message.data.request.metadata[SESSION_METADATA_KEY]
+        )
+        if session_operation.operation != "append":
+            return False
+        else:
+            assert isinstance(self.session_hooks, BatchedSessionHooks)
+            assert session_operation.chunk is not None
+            return self.session_hooks.gathers_peers(
+                message.data, session_operation.chunk
+            )
 
     def compute_batch(
         self, payloads: list[StagePayload]
