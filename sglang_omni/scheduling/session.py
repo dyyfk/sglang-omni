@@ -218,6 +218,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         self.gather_window_seconds = gather_window_seconds
         # note (Junnan Li): Operations that arrived while the previous call ran are batched as they are; only a call that starts from an idle stage waits.
         self.is_backlogged = False
+        self.batch_gathers_peers = True
 
     def warm_up_serving_thread(self) -> None:
         self.session_hooks.warm_up_serving_thread()
@@ -346,7 +347,8 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         try:
             results = self.compute_batch([message.data for message in batch])
         finally:
-            self.is_backlogged = not self.inbox.empty()
+            # note (ruoyu): A batch that was not held cost no window, so work queued behind it is not a backlog.
+            self.is_backlogged = self.batch_gathers_peers and not self.inbox.empty()
         for message, result in zip(batch, results, strict=True):
             if self.consume_if_aborted(message.request_id):
                 continue
@@ -364,9 +366,12 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         is untouched.
         """
         batch = super().collect_batch(first_msg)
+        self.batch_gathers_peers = self.gather_window_seconds == 0 or any(
+            self.gathers_peers(message) for message in batch
+        )
         if self.gather_window_seconds == 0 or self.is_backlogged:
             return batch
-        elif not any(self.gathers_peers(message) for message in batch):
+        elif not self.batch_gathers_peers:
             return batch
         else:
             pass
@@ -406,14 +411,15 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
 
     def gathers_peers(self, message: IncomingMessage) -> bool:
         """Whether holding the batch for more appends can batch this message's work."""
-        session_operation = SessionOperation.from_dict(
-            message.data.request.metadata[SESSION_METADATA_KEY]
-        )
-        if session_operation.operation != "append":
+        with self.session_table_lock:
+            arrival = self.arrivals_by_request_id.get(message.request_id)
+        if arrival is None or arrival.operation != "append":
             return False
         else:
+            # note (ruoyu): An accepted append parsed this metadata in register_operation, so it cannot raise here.
+            session_operation = find_session_operation(message.data.request.metadata)
             assert isinstance(self.session_hooks, BatchedSessionHooks)
-            assert session_operation.chunk is not None
+            assert session_operation is not None and session_operation.chunk is not None
             return self.session_hooks.gathers_peers(
                 message.data, session_operation.chunk
             )
