@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -32,6 +33,7 @@ SPECIAL_TOKEN_ID_START = 100
 BAD_TOKEN_IDS = (7, 8, 94)
 PLAIN_TOKEN_ID = 42
 OTHER_TOKEN_ID = 55
+THIRD_TOKEN_ID = 60
 
 
 def bare_runner() -> MiniCPMOThinkerModelRunner:
@@ -393,6 +395,44 @@ def test_sampled_rows_draw_from_their_filtered_support() -> None:
         closing.generated_history,
         zero_temperature.generated_history,
     ) == ([OTHER_TOKEN_ID], [], [PLAIN_TOKEN_ID])
+
+
+DRAW_COUNT = 6000
+FREQUENCY_TOLERANCE = 0.03
+
+
+@pytest.mark.parametrize(
+    ("top_p", "expected_frequencies"),
+    [
+        (1.0, {PLAIN_TOKEN_ID: 0.7, OTHER_TOKEN_ID: 0.2, THIRD_TOKEN_ID: 0.1}),
+        (
+            0.75,
+            {PLAIN_TOKEN_ID: 0.7 / 0.9, OTHER_TOKEN_ID: 0.2 / 0.9, THIRD_TOKEN_ID: 0.0},
+        ),
+    ],
+    ids=["softmax", "nucleus-drops-the-tail"],
+)
+def test_sampled_tokens_follow_the_filtered_softmax(
+    top_p: float, expected_frequencies: dict[int, float]
+) -> None:
+    torch.manual_seed(0)
+    runner = duplex_runner(SPECIAL_TOKENS)
+    state = session_state(greedy=False, temperature=1.0, top_k=-1, top_p=top_p)
+    logits = unit_logits(
+        {
+            PLAIN_TOKEN_ID: math.log(0.7),
+            OTHER_TOKEN_ID: math.log(0.2),
+            THIRD_TOKEN_ID: math.log(0.1),
+        }
+    )
+    counts = {token_id: 0 for token_id in expected_frequencies}
+
+    for _ in range(DRAW_COUNT):
+        (token_id,) = sample(runner, logits, [unit_request(state)])
+        counts[token_id] += 1
+
+    for token_id, expected in expected_frequencies.items():
+        assert abs(counts[token_id] / DRAW_COUNT - expected) <= FREQUENCY_TOLERANCE
 
 
 def test_top_k_and_top_p_filter_each_row_of_a_batch() -> None:

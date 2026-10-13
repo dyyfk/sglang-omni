@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from sglang_omni.proto import StagePayload
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.session import SessionAppend, SessionScheduler
@@ -152,6 +152,42 @@ def test_idle_stage_gathers_appends_within_the_window(
     scheduler = SessionScheduler(hooks_class(), max_concurrency=1)
     assert run_batches(monkeypatch, scheduler, session_ids, arrivals) == batches
     assert len(scheduler.inbox.timeouts) == waits
+
+
+def test_an_ordinary_request_in_the_batch_is_neither_held_nor_fatal(monkeypatch):
+    """A message without session metadata has no arrival; the batch runs without waiting."""
+    inbox = ScriptedInbox()
+    scheduler = SessionScheduler(IdleSessionHooks(), max_concurrency=1)
+    script_arrivals(monkeypatch, scheduler, inbox, "ab", [])
+    plain = IncomingMessage(
+        "plain-0", "new_request", StagePayload("plain-0", OmniRequest(None), {})
+    )
+    scheduler.register_operation(plain)
+    inbox.arrivals.append((0.0, plain))
+
+    assert run_next_batch(scheduler, inbox) == ["plain-0"]
+    assert inbox.timeouts == []
+
+
+class IdleTimedHooks(TimedWindowHooks):
+    """Appends of session a carry no work, and every batched call takes HOOK_SECONDS."""
+
+    def gathers_peers(self, payload: StagePayload, chunk: TimedChunk) -> bool:
+        return not payload.request_id.startswith("a")
+
+
+def test_an_unheld_batch_does_not_make_the_next_append_skip_its_wait(monkeypatch):
+    inbox = ScriptedInbox()
+    scheduler = SessionScheduler(IdleTimedHooks(inbox))
+    arrivals = [("a0", 0), ("b0", HOOK_SECONDS / 2), ("c0", 0.1)]
+    script_arrivals(monkeypatch, scheduler, inbox, "abc", arrivals)
+
+    assert run_next_batch(scheduler, inbox) == ["a0"]
+    assert not scheduler.is_backlogged
+    assert inbox.timeouts == []
+
+    assert run_next_batch(scheduler, inbox) == ["b0"]
+    assert len(inbox.timeouts) == 1
 
 
 def test_work_arriving_during_a_hook_skips_the_next_wait_until_the_queue_drains(
