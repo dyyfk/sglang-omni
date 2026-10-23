@@ -215,8 +215,8 @@ export class Settings {
     const { type, silenceMs, eagerness } = this.state.turn;
     if (!this.turnTypes.includes(type)) return null;
     const detection = { type };
-    const silence = parseInt(silenceMs, 10);
-    if (type === "server_vad" && Number.isFinite(silence)) detection.silence_duration_ms = silence;
+    const silenceDurationMs = parseInt(silenceMs, 10);
+    if (type === "server_vad" && Number.isFinite(silenceDurationMs)) detection.silence_duration_ms = silenceDurationMs;
     if (type === "semantic_vad" && EAGERNESS_LEVELS.includes(eagerness)) detection.eagerness = eagerness;
     return detection;
   }
@@ -292,12 +292,13 @@ export class Settings {
     ui.outputRow.hidden = !outputs.includes("text");
     ui.setOutput.value = this.state.output;
     const turnTypes = this.turnTypes;
+    const turnType = turnTypes.includes(this.state.turn.type) ? this.state.turn.type : "";
     ui.turnRow.hidden = !turnTypes.length;
     ui.setTurnType.replaceChildren(new Option("Deployment default", ""), ...turnTypes.map((type) => new Option(TURN_TYPE_LABELS[type], type)));
-    ui.setTurnType.value = turnTypes.includes(this.state.turn.type) ? this.state.turn.type : "";
-    ui.silenceRow.hidden = ui.setTurnType.value !== "server_vad";
+    ui.setTurnType.value = turnType;
+    ui.silenceRow.hidden = turnType !== "server_vad";
     ui.setSilence.value = this.state.turn.silenceMs;
-    ui.eagernessRow.hidden = ui.setTurnType.value !== "semantic_vad";
+    ui.eagernessRow.hidden = turnType !== "semantic_vad";
     ui.setEagerness.value = this.state.turn.eagerness;
     const image = this.capabilities && this.capabilities.input_image_format;
     ui.sliceRow.hidden = !image || !(image.max_slice_nums > 1);
@@ -307,8 +308,7 @@ export class Settings {
     }
     ui.greedyRow.hidden = !this.samplingKeys.includes("greedy");
     ui.setGreedy.checked = Boolean(this.state.sampling.greedy);
-    const fields = this.samplingFields;
-    ui.samplingFields.replaceChildren(...fields.map((field) => {
+    ui.samplingFields.replaceChildren(...this.samplingFields.map((field) => {
       const label = document.createElement("label");
       label.className = "field inline";
       const input = Object.assign(document.createElement("input"), { type: "number", name: field.key, step: field.step, placeholder: DEFAULT_PLACEHOLDER, value: this.state.sampling[field.key] ?? "" });
