@@ -6,6 +6,9 @@ import vm from "node:vm";
 import { DuplexSession } from "./session.js";
 
 const appSource = readFileSync(new URL("./app.js", import.meta.url), "utf8").replace(/^import .+;$/gm, "");
+// The settings panel is the realtime page's module, served under this page's path by playground/cascade/app.py.
+const settingsSource = readFileSync(new URL("../../../realtime/frontend/orb/settings.js", import.meta.url), "utf8");
+const pageSource = readFileSync(new URL("./index.html", import.meta.url), "utf8");
 
 // The page with a settings panel that answers the given session options; locks records what the page asked the panel to lock.
 function createApp(sessionOptions) {
@@ -92,6 +95,18 @@ async function firstSessionUpdate(app) {
   await app.settled();
   return { socket, session: socket.sent.find((event) => event.type === "session.update").session };
 }
+
+test("the page has every element and every session.js export the shared settings module uses", async () => {
+  const usedIds = [...new Set([...settingsSource.matchAll(/\bui\.([A-Za-z]+)/g)].map((match) => match[1]))];
+  const pageIds = new Set([...pageSource.matchAll(/\bid="([A-Za-z]+)"/g)].map((match) => match[1]));
+  const lookedUpIds = new Set([...appSource.match(/const ids = \[([^\]]*)\]/)[1].matchAll(/"([A-Za-z]+)"/g)].map((match) => match[1]));
+  assert.deepEqual(usedIds.filter((id) => !pageIds.has(id)), []);
+  assert.deepEqual(usedIds.filter((id) => !lookedUpIds.has(id)), []);
+  const importedNames = [...settingsSource.matchAll(/^import \{([^}]+)\} from "\.\/session\.js";/gm)].flatMap((match) => match[1].split(",").map((name) => name.trim()));
+  const session = await import("./session.js");
+  assert.ok(importedNames.length > 0);
+  assert.deepEqual(importedNames.filter((name) => typeof session[name] !== "function"), []);
+});
 
 test("the page sends only output_modalities while the panel is empty and the chosen settings otherwise, locked during the call", async () => {
   const empty = createApp({ instructions: "", outputModalities: ["audio"], extension: {}, turnDetection: null });
