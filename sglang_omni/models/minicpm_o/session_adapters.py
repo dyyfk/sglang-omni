@@ -94,7 +94,7 @@ class ThinkerAdapter(ARSessionAdapter):
         state.is_interrupt_pending = False
         prefix = [] if state.is_prefix_pending else [self.special.unit_end]
         if is_interrupted and not state.is_turn_ended:
-            # Note (ruoyu): The official MiniCPM-o forced listen feeds turn_eos first when the model is mid-turn. Without it the model reads the stop as a pause and resumes the cut sentence when it next speaks.
+            # note (ruoyu): Without turn_eos the model reads the stop as a pause in its own turn.
             suffix = [self.special.turn_eos]
         else:
             suffix = []
@@ -148,7 +148,7 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         state.is_prefix_pending = False
         if data.is_interrupted:
-            # Note (ruoyu): Without the ended turn, the next sampled listen is rewritten into speech and the stopped reply resumes.
+            # note (ruoyu): Without the ended turn, the next sampled listen is rewritten into speech and the stopped reply resumes.
             state.is_turn_ended = True
         else:
             pass
@@ -179,8 +179,8 @@ class OutputConverter:
         self.serial: int = 0
 
     def cancel(self) -> int | None:
-        """Mark the open reply cancelled and return its turn; None when no reply is open."""
-        if self.response_id is None:
+        """Mark the open reply cancelled and return its turn; None when no reply is open or it is already cancelled."""
+        if self.response_id is None or self.cancelled_turn is not None:
             return None
         else:
             self.cancelled_turn = self.turn
@@ -190,7 +190,7 @@ class OutputConverter:
         if self.response_id is None:
             return []
         else:
-            if self.turn == self.cancelled_turn:
+            if self.cancelled_turn is not None:
                 status: ResponseStatus = "cancelled"
                 reason = "interrupted"
             else:
@@ -222,8 +222,8 @@ class OutputConverter:
     def __call__(self, output: OutputChunk) -> list[OutputEvent]:
         value = output.payload
         events: list[OutputEvent] = []
-        if output.turn == self.cancelled_turn:
-            # Note (ruoyu): The client stopped this reply, so what the pipeline still produces for its turn is not played.
+        if self.cancelled_turn is not None and output.turn == self.cancelled_turn:
+            # note (ruoyu): The client stopped this reply, so what the pipeline still produces for its turn is not played.
             pass
         elif value["text"] or value["pcm"]:
             if self.response_id is None:
