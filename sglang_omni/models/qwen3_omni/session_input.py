@@ -20,6 +20,7 @@ from sglang_omni.proto.session import ResourceUsage, SessionIdentity, TimedChunk
 from sglang_omni.proto.streams import (
     AUDIO,
     COMMIT,
+    CONFIGURE,
     CONTROL,
     IMAGE_FRAME,
     INTERRUPT,
@@ -205,6 +206,19 @@ class QwenInputHooks(SessionHooks):
                 )
             else:
                 pass
+            return payload
+        elif event_type == CONFIGURE:
+            # Note (ruoyu): A client's appended configure reaches only the readers of input:session, so the dialog hands it to the model node's control edge.
+            state.emit(
+                TimedChunk(
+                    CONTROL,
+                    state.input_end_ms,
+                    0,
+                    0,
+                    chunk.payload,
+                    format=SESSION_CONTROL,
+                )
+            )
             return payload
         elif event_type == SPEECH_STARTED and state.answering is not None:
             self.interrupt(state)
