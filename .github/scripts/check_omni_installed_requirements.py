@@ -89,9 +89,20 @@ def installed_distributions() -> list[InstalledDistribution]:
     return environment
 
 
+def first_installed_copies(
+    environment: list[InstalledDistribution],
+) -> list[InstalledDistribution]:
+    # Note (ruoyu): pip's distribution finder skips every copy of a name after the first on sys.path, so later copies never reach pip check.
+    first_copies: dict[str, InstalledDistribution] = {}
+    for distribution in environment:
+        first_copies.setdefault(distribution.name, distribution)
+    return list(first_copies.values())
+
+
 def find_conflicts(
     environment: list[InstalledDistribution],
 ) -> list[RequirementConflict]:
+    environment = first_installed_copies(environment)
     installed_versions = {
         distribution.name: distribution.version for distribution in environment
     }
@@ -134,7 +145,7 @@ def find_platform_conflicts(
     environment: list[InstalledDistribution], supported_tags: frozenset[Tag]
 ) -> list[PlatformConflict]:
     conflicts: list[PlatformConflict] = []
-    for distribution in environment:
+    for distribution in first_installed_copies(environment):
         recorded_tags: set[Tag] = set()
         for wheel_tag in distribution.wheel_tags:
             recorded_tags.update(parse_tag(wheel_tag))
