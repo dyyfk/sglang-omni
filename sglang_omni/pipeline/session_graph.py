@@ -528,9 +528,16 @@ class SessionGraphRunner(CoordinatorSessions):
             if not holds_turn_end(chunk, pacer is not None, is_published):
                 for reader in graph.graph.reading_nodes(name, output.format):
                     await self.put_graph_inbox(graph, reader, name, chunk)
+                    # Note (ruoyu): The chunk passed the fence before a full edge held it, and the interrupt may have landed during the wait.
+                    if any(
+                        is_interrupted_reply(chunk, turn)
+                        for turn in graph.interrupted_turns.get(name, ())
+                    ):
+                        break
+                    else:
+                        pass
             else:
                 pass
-            # Note (ruoyu): The chunk passed the fence before a full edge held it, and the interrupt may have landed during the wait.
             if any(
                 is_interrupted_reply(chunk, turn)
                 for turn in graph.interrupted_turns.get(name, ())
