@@ -69,8 +69,10 @@ let warnTimer = null;
 const orb = new Orb(ui.orbCanvas);
 const capabilitiesUrl = window.DEMO_CAPABILITIES_URL || (window.DEMO_WS_URL || "").replace(/^ws/, "http").replace(/\/v1\/realtime.*$/, "/v1/realtime/capabilities");
 // Note (ruoyu): an empty field is not sent, so a fresh page sends only output_modalities and the profile's prompt and
-// turn detection apply; filled fields are kept per deployment model in this browser until Reset to defaults.
-const settings = new Settings(ui, { capabilitiesUrl, defaultInstructions: window.DEMO_INSTRUCTIONS || "" });
+// turn detection apply; filled fields are kept per deployment model in this browser until Reset to defaults. No text-only
+// replies: the captions and conversation.item.truncate follow audio playback, so without audio the caption stays faint
+// and a barge-in truncates at 0 ms.
+const settings = new Settings(ui, { capabilitiesUrl, defaultInstructions: window.DEMO_INSTRUCTIONS || "", offersTextOnly: false });
 const darkQuery = matchMedia("(prefers-color-scheme: dark)");
 
 // Deployment-specific text comes from config.js, so one page serves any duplex model.
