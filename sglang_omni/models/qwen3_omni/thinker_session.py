@@ -45,6 +45,9 @@ class ThinkerUnit:
     model_inputs: ModelInputs
     prompt_start: int
     prefix_model_inputs: ModelInputs
+    # Note (ruoyu): A cut that lands while the unit generates cannot reach the native KV it was prefilled on, so the unit records the aborted turn it refilled and whether such a cut made that KV stale.
+    refilled_turn: int | None = None
+    has_stale_kv: bool = False
 
 
 @dataclass(kw_only=True)
@@ -67,7 +70,7 @@ class ThinkerHistory:
     model_inputs_before_last_prompt: ModelInputs = field(default_factory=dict)
     unit: ThinkerUnit | None = None
     pending: PendingTurn | None = None
-    # Note (Junnan Li): A truncate of a committed reply cuts KV the native session cannot cut, so units re-prefill the whole history until one commits.
+    # Note (Junnan Li): A truncate of a committed reply cuts KV the native session cannot cut, so units re-prefill the whole history until one commits with no cut landed while it ran.
     rebuild: bool = False
 
 
@@ -147,31 +150,61 @@ class QwenThinkerSessionAdapter(ARSessionAdapter):
 
     def truncate(self, history: ThinkerHistory, turn: int | None, heard: int) -> None:
         pending = history.pending
+        inflight = history.unit
         if pending is not None and pending.unit.turn == turn:
-            pending.heard = min(
-                heard,
-                len(pending.generated) if pending.heard is None else pending.heard,
+            heard_so_far = (
+                len(pending.generated) if pending.heard is None else pending.heard
             )
+            pending.heard = min(heard, heard_so_far)
+            if (
+                inflight is not None
+                and inflight.refilled_turn == turn
+                and pending.heard < heard_so_far
+            ):
+                # Note (ruoyu): The unit in flight already refilled this reply in front of its prompt, so the cut lands there too.
+                refilled_prefix = self.refilled_ids(pending)
+                inflight.ids = [
+                    *refilled_prefix,
+                    *inflight.ids[inflight.prompt_start :],
+                ]
+                inflight.prompt_start = len(refilled_prefix)
+                inflight.has_stale_kv = True
+            else:
+                pass
         elif history.last_turn == turn:
             reply = history.ids[history.last_reply_start :]
-            # Note (Junnan Li): A reply already cut ends at its first <|im_end|>, so a later truncate only cuts further.
+            # Note (Junnan Li): A cut reply still ends at its first <|im_end|> when it had one, so a later truncate only cuts further.
             generated = (
                 reply[: reply.index(self.end_token_id)]
                 if self.end_token_id in reply
                 else reply
             )
             if heard < len(generated):
+                # Note (ruoyu): The cut reply keeps the ending it had, so the separator a unit built after it chose still fits.
                 history.ids = [
                     *history.ids[: history.last_reply_start],
                     *generated[:heard],
-                    self.end_token_id,
-                    *self.newline_ids,
+                    *reply[len(generated) :],
                 ]
                 history.rebuild = True
+                if inflight is not None:
+                    inflight.has_stale_kv = True
+                else:
+                    pass
             else:
                 pass
         else:
             pass
+
+    def refilled_ids(self, pending: PendingTurn) -> list[int]:
+        """The aborted unit with its reply cut to what was heard, as the next unit refills it in front of its prompt."""
+        heard = len(pending.generated) if pending.heard is None else pending.heard
+        return [
+            *pending.unit.ids,
+            *pending.generated[:heard],
+            self.end_token_id,
+            *self.newline_ids,
+        ]
 
     def prepare_unit(
         self,
@@ -203,18 +236,15 @@ class QwenThinkerSessionAdapter(ARSessionAdapter):
             # Note (Junnan Li): The dialog asks the interrupted utterance again in this unit, so only what preceded its prompt is refilled.
             unit_ids = pending.unit.ids[: pending.unit.prompt_start]
             unit_model_inputs = dict(pending.unit.prefix_model_inputs)
+            refilled_turn = None
         elif pending is not None:
-            heard = len(pending.generated) if pending.heard is None else pending.heard
-            unit_ids = [
-                *pending.unit.ids,
-                *pending.generated[:heard],
-                self.end_token_id,
-                *self.newline_ids,
-            ]
+            unit_ids = self.refilled_ids(pending)
             unit_model_inputs = dict(pending.unit.model_inputs)
+            refilled_turn = pending.unit.turn
         else:
             unit_ids = []
             unit_model_inputs = {}
+            refilled_turn = None
         prompt = dict(pipeline_state.prompt)
         prompt_ids: list[int] = prompt["input_ids"].tolist()
         if history.ids or unit_ids:
@@ -267,6 +297,7 @@ class QwenThinkerSessionAdapter(ARSessionAdapter):
             model_inputs=unit_model_inputs,
             prompt_start=prompt_start,
             prefix_model_inputs=prefix_model_inputs,
+            refilled_turn=refilled_turn,
         )
         return request_data
 
@@ -347,7 +378,7 @@ class QwenThinkerSessionAdapter(ARSessionAdapter):
         inflight = history.unit
         assert inflight is not None
         output_ids = [int(token_id) for token_id in request_data.output_ids]
-        history.rebuild = False
+        history.rebuild = inflight.has_stale_kv
         history.last_prompt_start = len(history.ids) + inflight.prompt_start
         history.model_inputs_before_last_prompt = merge_model_inputs(
             history.model_inputs, inflight.prefix_model_inputs
