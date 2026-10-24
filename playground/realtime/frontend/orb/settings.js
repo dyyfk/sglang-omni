@@ -38,6 +38,9 @@ const TURN_BASED_LABELS = { max_new_tokens_per_unit: "Reply token limit" };
 const INTEGER_FIELDS = new Set(["top_k", "force_listen_count", "max_new_tokens_per_unit", "max_new_tokens", "repetition_window_size", "talker_top_k", "talker_max_new_tokens", "audio_top_k", "seed"]);
 const TURN_TYPE_LABELS = { server_vad: "Silence ends the turn (server VAD)", semantic_vad: "End-of-turn model (semantic VAD)" };
 const EAGERNESS_LEVELS = ["low", "medium", "high"];
+// Note (ruoyu): the VAD node's own default in sglang_omni/models/vad/node.py. A profile that runs its vad stage with a shorter
+// pause for an end-of-turn model (base-clone: 160 ms) would otherwise cut a bare server_vad pick at every short pause.
+const SERVER_VAD_SILENCE_MS = 800;
 
 // Float32 mono samples at 16 kHz -> the {media_type, data} WAV the server accepts.
 function referenceWav(samples) {
@@ -372,6 +375,7 @@ export class Settings {
     ui.setMic.addEventListener("change", () => { this.state.mic = ui.setMic.value; this.save(); });
     ui.setTurnType.addEventListener("change", () => {
       this.state.turn.type = ui.setTurnType.value;
+      if (ui.setTurnType.value === "server_vad" && this.state.turn.silenceMs === "") this.state.turn.silenceMs = String(SERVER_VAD_SILENCE_MS);
       this.save();
       this.render();
     });
