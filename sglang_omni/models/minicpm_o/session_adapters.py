@@ -93,7 +93,12 @@ class ThinkerAdapter(ARSessionAdapter):
         is_interrupted = state.is_interrupt_pending
         state.is_interrupt_pending = False
         prefix = [] if state.is_prefix_pending else [self.special.unit_end]
-        token_ids = [*prefix, *plan["token_ids"]]
+        if is_interrupted and not state.is_turn_ended:
+            # Note (ruoyu): The official MiniCPM-o forced listen feeds turn_eos first when the model is mid-turn. Without it the model reads the stop as a pause and resumes the cut sentence when it next speaks.
+            suffix = [self.special.turn_eos]
+        else:
+            suffix = []
+        token_ids = [*prefix, *plan["token_ids"], *suffix]
         spans = [
             EmbeddingSpan(
                 start=span["token_start"] + len(prefix),
@@ -143,7 +148,7 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         state.is_prefix_pending = False
         if data.is_interrupted:
-            # Note (ruoyu): The forced listen closes the model's turn; otherwise the next sampled listen is rewritten into speech and the stopped reply resumes.
+            # Note (ruoyu): Without the ended turn, the next sampled listen is rewritten into speech and the stopped reply resumes.
             state.is_turn_ended = True
         else:
             pass
