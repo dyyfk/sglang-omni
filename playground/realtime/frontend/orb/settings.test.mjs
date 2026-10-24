@@ -179,8 +179,7 @@ test("Qwen3-Omni gets its own sampling knobs and server VAD, no preset and no vo
   await choose(ui, "setTurnType", "server_vad");
   assert.equal(ui.silenceRow.hidden, false);
   assert.equal(ui.eagernessRow.hidden, true);
-  ui.setSilence.value = "800";
-  ui.setSilence.listeners.input();
+  assert.equal(ui.setSilence.value, "800");
   typePrompt(ui, "Reply in one sentence.");
   typeSampling(ui, "temperature", "0.3");
   typeSampling(ui, "max_new_tokens", "256");
@@ -208,6 +207,14 @@ test("the streaming cascade labels the token limit as a reply limit and offers b
   assert.equal(requests.includes("/api/presets"), false);
   assert.deepEqual(optionValues(ui.setTurnType), ["", "server_vad", "semantic_vad"]);
   assert.deepEqual(sessionUpdate(settings), { output_modalities: ["audio"] });
+
+  // A bare server_vad inherits the profile's VAD pause, 160 ms on base-clone, so the pick prefills the VAD node's own 800 ms and the user may edit it.
+  await choose(ui, "setTurnType", "server_vad");
+  assert.equal(ui.setSilence.value, "800");
+  assert.deepEqual(sessionUpdate(settings).audio, { input: { turn_detection: { type: "server_vad", silence_duration_ms: 800 } } });
+  ui.setSilence.value = "1200";
+  ui.setSilence.listeners.input();
+  assert.equal(sessionUpdate(settings).audio.input.turn_detection.silence_duration_ms, 1200);
 
   await choose(ui, "setTurnType", "semantic_vad");
   assert.equal(ui.silenceRow.hidden, true);
