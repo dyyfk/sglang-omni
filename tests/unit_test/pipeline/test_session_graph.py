@@ -823,7 +823,7 @@ async def test_an_interrupt_drops_released_audio_still_waiting_for_the_client():
             )
 
     filler = reply(None, 0)
-    graph.outputs.put_nowait((filler, 0))
+    graph.outputs.put_nowait((filler, 0, "speaker"))
     pacer.offer(reply("turn.started", 1), 10)
     pacer.offer(reply(None, 1), 3300)
     graph.output_bytes = 3310
@@ -903,19 +903,30 @@ async def test_an_interrupt_tells_the_paced_node_readers_the_audio_it_delivered(
     await outputs.aclose()
 
 
-@pytest.mark.asyncio
-async def test_an_interrupt_drops_the_turn_output_the_client_has_not_taken():
-    """Output of an interrupted turn still queued for a slow client reached it after the interrupt, and reply.delivered came from the queued audio, not from what the client took."""
-    identity = SessionIdentity("graph", 1)
+def speaker_audio(turn: int, t_start_ms: float) -> OutputChunk:
+    return OutputChunk(
+        SessionIdentity("graph:speaker", 1),
+        0,
+        0,
+        "audio",
+        t_start_ms,
+        100,
+        bytes(3200),
+        "pcm16",
+        turn=turn,
+    )
+
+
+def paced_speaker_runtime(runner: SessionGraphRunner) -> SessionGraphRuntime:
+    """A paced speaker the client interrupts and a listener reads controls from, beside a dialog; both the speaker and the dialog publish, and the speaker's node session is registered."""
     nodes = {
         "speaker": SessionNode(
             ("speaker",), ("input",), controls=(ControlEdge("input", "interrupt"),)
         ),
-        "writer": SessionNode(("writer",), ("input",)),
+        "dialog": SessionNode(("dialog",), ("input",)),
         "listener": SessionNode(("listener",), ("speaker:session",)),
     }
     identities = {name: SessionIdentity(f"graph:{name}", 1) for name in nodes}
-    runner = NodeOutputsRunner([])
     runner.sessions[identities["speaker"].id] = Session(
         session_identity=identities["speaker"],
         request=OmniRequest(None),
@@ -924,68 +935,123 @@ async def test_an_interrupt_drops_the_turn_output_the_client_has_not_taken():
         limits=SessionLimits(),
         is_node=True,
     )
-    pacer = DeliveryPacer(250, asyncio.Event())
-    graph = SessionGraphRuntime(
-        session_identity=identity,
+    return SessionGraphRuntime(
+        session_identity=SessionIdentity("graph", 1),
         graph=SessionGraph(
             nodes=nodes,
-            publish={"speaker": ("pcm16", "session"), "writer": ("text_delta",)},
+            publish={
+                "speaker": ("pcm16", "session"),
+                "dialog": ("text_delta", "session"),
+            },
         ),
         nodes=identities,
         limits=SessionLimits(),
         inboxes={name: NodeInbox() for name in nodes},
         outputs=asyncio.Queue(),
-        pacers={"speaker": pacer},
+        pacers={"speaker": DeliveryPacer(250, asyncio.Event())},
         client_sequences={name: {} for name in nodes},
     )
 
-    def audio(turn: int, t_start_ms: float) -> OutputChunk:
-        return OutputChunk(
-            identities["speaker"],
-            0,
-            0,
-            "audio",
-            t_start_ms,
-            100,
-            bytes(3200),
-            "pcm16",
-            turn=turn,
-        )
+
+@pytest.mark.asyncio
+async def test_an_interrupt_drops_the_turn_output_the_client_has_not_taken():
+    """Output of an interrupted turn still queued for a slow client reached it after the interrupt, and reply.delivered came from the queued audio, not from what the client took. A turn.done already published stays for the client."""
+    runner = NodeOutputsRunner([])
+    graph = paced_speaker_runtime(runner)
+    pacer = graph.pacers["speaker"]
 
     async def route(name: str, node_outputs: list[OutputChunk]) -> None:
         runner.node_outputs = node_outputs
         await runner.route_graph_outputs(graph, name)
         await wait_until(lambda: not pacer.items and not pacer.unsent)
 
-    heard_audio = audio(1, 0)
-    unheard_audio = audio(1, 100)
-    writer_text = reply_output("text_delta", {"text": "kept"}, 1)
-    speaker_end = reply_output("session", {"type": "turn.interrupted"}, 1)
-    next_turn_audio = audio(2, 200)
+    taken_audio = speaker_audio(1, 0)
+    untaken_audio = speaker_audio(1, 100)
+    dialog_text = reply_output("text_delta", {"text": "kept"}, 1)
+    speaker_done = reply_output("session", {"type": "turn.done"}, 1)
+    dialog_end = reply_output("session", {"type": "turn.interrupted"}, 1)
     delivery = asyncio.create_task(runner.deliver_paced_outputs(graph, "speaker"))
     outputs = runner.graph_outputs(graph)
-    await route("speaker", [heard_audio])
+    await route("speaker", [taken_audio])
     taken = await collect(outputs, 1)
-    await route("speaker", [unheard_audio])
-    await route("writer", [writer_text])
-    await route("speaker", [speaker_end, next_turn_audio])
+    await route("dialog", [dialog_text])
+    await route("speaker", [untaken_audio, speaker_done])
     interrupt = TimedChunk("control", 0, 0, 0, {"type": "interrupt"}, "session", turn=1)
     await runner.control_graph(graph, interrupt, None, False)
-    taken += await collect(outputs, 3)
+    await route("dialog", [dialog_end])
+    taken += await collect(outputs, graph.outputs.qsize())
     delivery.cancel()
     await asyncio.gather(delivery, return_exceptions=True)
-    assert [replace(item, seq=0) for item in taken] == [
-        replace(output, session_identity=identity)
-        for output in (heard_audio, writer_text, speaker_end, next_turn_audio)
+    # Note (ruoyu): A seq is given when the output is published, so the dropped audio leaves seq 2 unseen.
+    assert taken == [
+        replace(output, session_identity=graph.session_identity, seq=seq)
+        for seq, output in (
+            (0, taken_audio),
+            (1, dialog_text),
+            (3, speaker_done),
+            (4, dialog_end),
+        )
     ]
     assert [
         (source, chunk.payload) for source, chunk, _ in graph.inboxes["listener"].queued
     ] == [
-        ("speaker", {"type": "turn.interrupted"}),
+        ("speaker", {"type": "turn.done"}),
         ("speaker", {"type": REPLY_DELIVERED, "audio_ms": 100}),
     ]
     assert graph.output_bytes == 0
     await outputs.aclose()
+
+
+QUEUED_AUDIO_OF_TURN_1 = (speaker_audio(1, 0), 0, "speaker")
+QUEUED_INPUT_DONE = (
+    OutputChunk(
+        SessionIdentity("graph", 1),
+        0,
+        0,
+        "audio",
+        0,
+        100,
+        None,
+        "pcm16",
+        kind="input_done",
+    ),
+    0,
+    "speaker",
+)
+QUEUED_AUDIO_OF_TURN_2 = (speaker_audio(2, 100), 0, "speaker")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interrupt_turn", "kept_outputs"),
+    [
+        (
+            None,
+            [QUEUED_AUDIO_OF_TURN_1, QUEUED_INPUT_DONE, QUEUED_AUDIO_OF_TURN_2, None],
+        ),
+        (1, [QUEUED_INPUT_DONE, QUEUED_AUDIO_OF_TURN_2, None]),
+    ],
+)
+async def test_an_interrupt_keeps_the_close_sentinel_and_drops_data_only_of_a_named_turn(
+    interrupt_turn, kept_outputs
+):
+    """An interrupt that met the close sentinel in the client's queue raised, even one naming no turn, which leaves the queue as it was."""
+    runner = NodeOutputsRunner([])
+    graph = paced_speaker_runtime(runner)
+    for queued_output in (
+        QUEUED_AUDIO_OF_TURN_1,
+        QUEUED_INPUT_DONE,
+        QUEUED_AUDIO_OF_TURN_2,
+        None,
+    ):
+        graph.outputs.put_nowait(queued_output)
+    interrupt = TimedChunk(
+        "control", 0, 0, 0, {"type": "interrupt"}, "session", turn=interrupt_turn
+    )
+    await runner.control_graph(graph, interrupt, None, False)
+    assert [
+        graph.outputs.get_nowait() for _ in range(graph.outputs.qsize())
+    ] == kept_outputs
 
 
 class TurnFront(SessionHooks):
