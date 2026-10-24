@@ -42,6 +42,11 @@ FIRST_RESPONSE = "session-response-0"
 FIRST_ITEM = "session-response-0-message"
 SECOND_RESPONSE = "session-response-1"
 SECOND_ITEM = "session-response-1-message"
+INTERRUPT_OF_TURN_1 = (
+    TimedChunk(CONTROL, 0, 0, 0, {"type": INTERRUPT}, format=SESSION_CONTROL, turn=1),
+    None,
+    False,
+)
 
 
 def voice(pcm: bytes, *, end_of_turn: bool = False) -> dict[str, object]:
@@ -57,7 +62,9 @@ def voice(pcm: bytes, *, end_of_turn: bool = False) -> dict[str, object]:
 class VoiceCoordinator(FakeSessionClient):
     """Answers each unit with the scripted (turn, voice chunk) of its seq, then input_done."""
 
-    def __init__(self, voice_chunks: dict[int, tuple[int, dict[str, object]]]) -> None:
+    def __init__(
+        self, voice_chunks: dict[int, tuple[int | None, dict[str, object]]]
+    ) -> None:
         super().__init__()
         self.voice_chunks = voice_chunks
 
@@ -98,7 +105,7 @@ def unit(seq: int) -> Unit:
 
 @pytest.mark.asyncio
 async def test_cancel_stops_the_open_reply_and_drops_its_later_audio() -> None:
-    """A client stop interrupts the open reply's turn; audio of that turn after the stop is dropped, and the reply ends as cancelled when its turn ends."""
+    """A client stop interrupts the open reply's turn; audio of that turn after the stop is dropped, the reply ends as cancelled when its turn ends, and the next reply completes as usual."""
     heard, unheard, tail, next_reply = (
         b"\1\0" * 4,
         b"\2\0" * 4,
@@ -110,7 +117,7 @@ async def test_cancel_stops_the_open_reply_and_drops_its_later_audio() -> None:
             0: (1, voice(heard)),
             1: (1, voice(unheard)),
             2: (1, voice(tail, end_of_turn=True)),
-            3: (2, voice(next_reply)),
+            3: (2, voice(next_reply, end_of_turn=True)),
         }
     )
     adapter, events = await open_adapter(coordinator)
@@ -121,15 +128,7 @@ async def test_cancel_stops_the_open_reply_and_drops_its_later_audio() -> None:
         await adapter.process(unit(seq))
     await adapter.close()
 
-    assert coordinator.controlled == [
-        (
-            TimedChunk(
-                CONTROL, 0, 0, 0, {"type": INTERRUPT}, format=SESSION_CONTROL, turn=1
-            ),
-            None,
-            False,
-        )
-    ]
+    assert coordinator.controlled == [INTERRUPT_OF_TURN_1]
     assert events == [
         ResponseStarted(FIRST_RESPONSE),
         AudioDelta(FIRST_RESPONSE, FIRST_ITEM, heard),
@@ -140,11 +139,34 @@ async def test_cancel_stops_the_open_reply_and_drops_its_later_audio() -> None:
         ),
         ResponseStarted(SECOND_RESPONSE),
         AudioDelta(SECOND_RESPONSE, SECOND_ITEM, next_reply),
+        TextFinished(SECOND_RESPONSE, SECOND_ITEM, ""),
+        AudioFinished(SECOND_RESPONSE, SECOND_ITEM),
+        ResponseFinished(SECOND_RESPONSE, SECOND_ITEM, "", True, "completed", "stop"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_second_cancel_of_the_same_reply_sends_no_control() -> None:
+    """A reply is interrupted once; a repeated client stop before it ends sends nothing more to the pipeline."""
+    heard = b"\1\0" * 4
+    coordinator = VoiceCoordinator({0: (1, voice(heard))})
+    adapter, events = await open_adapter(coordinator)
+
+    await adapter.process(unit(0))
+    await adapter.cancel()
+    await adapter.cancel()
+    await adapter.close()
+
+    assert coordinator.controlled == [INTERRUPT_OF_TURN_1]
+    assert events == [
+        ResponseStarted(FIRST_RESPONSE),
+        AudioDelta(FIRST_RESPONSE, FIRST_ITEM, heard),
     ]
 
 
 @pytest.mark.asyncio
 async def test_cancel_without_an_open_reply_sends_no_control() -> None:
+    """A client stop with no open reply sends nothing to the pipeline and emits no event."""
     coordinator = VoiceCoordinator({})
     adapter, events = await open_adapter(coordinator)
 
@@ -153,6 +175,26 @@ async def test_cancel_without_an_open_reply_sends_no_control() -> None:
 
     assert coordinator.controlled == []
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_a_reply_without_a_turn_plays_when_nothing_was_cancelled() -> None:
+    """Without a client stop, a voice chunk whose turn is unset is played and completes, not fenced as a cancelled turn."""
+    pcm = b"\1\0" * 4
+    coordinator = VoiceCoordinator({0: (None, voice(pcm, end_of_turn=True))})
+    adapter, events = await open_adapter(coordinator)
+
+    await adapter.process(unit(0))
+    await adapter.close()
+
+    assert coordinator.controlled == []
+    assert events == [
+        ResponseStarted(FIRST_RESPONSE),
+        AudioDelta(FIRST_RESPONSE, FIRST_ITEM, pcm),
+        TextFinished(FIRST_RESPONSE, FIRST_ITEM, ""),
+        AudioFinished(FIRST_RESPONSE, FIRST_ITEM),
+        ResponseFinished(FIRST_RESPONSE, FIRST_ITEM, "", True, "completed", "stop"),
+    ]
 
 
 async def open_session_params(

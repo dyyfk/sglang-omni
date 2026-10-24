@@ -290,14 +290,14 @@ def test_an_interrupt_forces_one_listen_unit_that_ends_the_turn(
     result = adapter.result(SESSION, interrupted)
     following = adapter.build(SESSION, audio_chunk, step_plan_payload(request))
 
-    assert (interrupted.is_listen_forced, interrupted.is_interrupted) == (True, True)
+    assert interrupted.is_listen_forced is True
     assert interrupted.input_ids.tolist() == interrupted_input_ids
     assert following.input_ids.tolist() == [SPECIAL_TOKENS.unit_end, PLAIN_TOKEN_ID]
     assert result.data == dict(
         talker_conditions=[], text="", is_listen=True, end_of_turn=True
     )
     assert state.is_turn_ended is True
-    assert (following.is_listen_forced, following.is_interrupted) == (False, False)
+    assert following.is_listen_forced is False
 
 
 def test_chunk_eos_from_the_first_sample_skips_the_second_stage() -> None:

@@ -32,6 +32,7 @@ PRE_LOOKAHEAD = 3
 UP_RATE = 2
 # note (Junnan Li): Large enough that a session's pending-token list is a rounding error next to its caches.
 OPENED_HISTORY_FRAMES = 8192
+SPEAKING_TOKENS = list(range(CODEC_CHUNK_SIZE))
 
 
 class FakeToken2Wav:
@@ -274,9 +275,10 @@ def speech_append(
     codec_tokens: list[int],
     is_listen: bool,
     end_of_turn: bool = False,
+    eos: bool = False,
 ) -> SessionAppend:
     return SessionAppend(
-        chunk=TimedChunk("text", 0, 1000, 0, None),
+        chunk=TimedChunk("text", 0, 1000, 0, None, eos=eos),
         payload=SimpleNamespace(
             data=dict(
                 text="hi",
@@ -350,21 +352,41 @@ def test_speech_hooks_emit_one_voice_chunk_per_unit() -> None:
     assert runtime.token2wav.forward_sizes == [1]
 
 
-def test_speech_hooks_stamp_voice_chunks_with_the_reply_turn() -> None:
-    """A reply's chunks share one turn up to its end of turn; the next reply gets the next turn."""
+@pytest.mark.parametrize(
+    ("units", "expected_turns"),
+    [
+        (
+            (
+                ([], True, False, False),
+                (SPEAKING_TOKENS, False, False, False),
+                (SPEAKING_TOKENS, False, True, False),
+                ([], True, False, False),
+                (SPEAKING_TOKENS, False, False, False),
+            ),
+            [0, 0, 0, 1, 1],
+        ),
+        (
+            (
+                (SPEAKING_TOKENS, False, False, False),
+                ([], True, False, True),
+                (SPEAKING_TOKENS, False, False, False),
+            ),
+            [0, 0, 1],
+        ),
+    ],
+    ids=["model_end_of_turn", "input_end"],
+)
+def test_speech_hooks_stamp_voice_chunks_with_the_reply_turn(
+    units: tuple[tuple[list[int], bool, bool, bool], ...],
+    expected_turns: list[int],
+) -> None:
+    """A reply's chunks share one turn up to its end of turn or the input end; the next reply gets the next turn."""
     hooks = SpeechHooks(open_runtime([]), b"voice")
     session_identity = SessionIdentity("s")
     hooks.open(session_identity, SimpleNamespace(params={}))
     chunks: list[TimedChunk] = []
-    speaking_tokens = list(range(CODEC_CHUNK_SIZE))
 
-    for codec_tokens, is_listen, end_of_turn in (
-        ([], True, False),
-        (speaking_tokens, False, False),
-        (speaking_tokens, False, True),
-        ([], True, False),
-        (speaking_tokens, False, False),
-    ):
+    for codec_tokens, is_listen, end_of_turn, eos in units:
         hooks.append_batch(
             [
                 speech_append(
@@ -373,8 +395,9 @@ def test_speech_hooks_stamp_voice_chunks_with_the_reply_turn() -> None:
                     codec_tokens=codec_tokens,
                     is_listen=is_listen,
                     end_of_turn=end_of_turn,
+                    eos=eos,
                 )
             ]
         )
 
-    assert [chunk.turn for chunk in chunks] == [0, 0, 0, 1, 1]
+    assert [chunk.turn for chunk in chunks] == expected_turns
