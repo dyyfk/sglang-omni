@@ -100,6 +100,41 @@ def test_find_platform_conflicts_reads_the_recorded_wheel_tags():
     )
 
 
+def test_first_installed_copy_decides_like_pip():
+    """With a distribution installed twice, pip reads the first copy on sys.path, so its version, requirements and wheel tags decide."""
+    supported = frozenset(MODULE.parse_tag("py3-none-any"))
+    environment = [
+        MODULE.InstalledDistribution(
+            name="qwen-tts",
+            version="0.1.1",
+            requirements=("transformers==4.57.3",),
+            wheel_tags=("py3-none-any",),
+        ),
+        MODULE.InstalledDistribution(
+            name="transformers",
+            version="5.19.0",
+            requirements=(),
+            wheel_tags=("py3-none-any",),
+        ),
+        MODULE.InstalledDistribution(
+            name="transformers",
+            version="4.57.3",
+            requirements=("tokenizers<0.22",),
+            wheel_tags=("cp36-cp36m-manylinux2010_x86_64",),
+        ),
+    ]
+
+    assert MODULE.find_conflicts(environment) == [
+        MODULE.RequirementConflict(
+            distribution="qwen-tts",
+            version="0.1.1",
+            requirement="transformers==4.57.3",
+            installed_version="5.19.0",
+        )
+    ]
+    assert MODULE.find_platform_conflicts(environment, supported) == []
+
+
 def test_unexpected_conflicts_leave_only_unreviewed_pairs():
     """A reviewed distribution and requirement pair passes, any other pair fails the check."""
     reviewed = MODULE.RequirementConflict(
