@@ -261,8 +261,18 @@ def step_plan_payload(request: OmniRequest) -> StagePayload:
     )
 
 
-def test_an_interrupt_forces_one_listen_unit_that_ends_the_turn() -> None:
-    """A client stop mid-reply: the next unit listens and reports the end of the turn, and the one after is free again."""
+@pytest.mark.parametrize(
+    ("is_turn_ended", "interrupted_input_ids"),
+    [
+        (False, [PLAIN_TOKEN_ID, SPECIAL_TOKENS.turn_eos]),
+        (True, [PLAIN_TOKEN_ID]),
+    ],
+    ids=["mid_reply", "after_the_model_ended_its_turn"],
+)
+def test_an_interrupt_forces_one_listen_unit_that_ends_the_turn(
+    is_turn_ended: bool, interrupted_input_ids: list[int]
+) -> None:
+    """A client stop: the next unit closes an open turn with turn_eos, listens and reports the end of the turn, and the one after is free again."""
     tokenizer = duplex_tokenizer()
     tokenizer.decode.return_value = ""
     adapter = ThinkerAdapter(tokenizer, VOCAB_SIZE)
@@ -271,7 +281,7 @@ def test_an_interrupt_forces_one_listen_unit_that_ends_the_turn() -> None:
     )
     adapter.open(SESSION, request)
     state = adapter.states[SESSION]
-    state.is_turn_ended = False
+    state.is_turn_ended = is_turn_ended
     audio_chunk = TimedChunk("audio", 0, 1000, 0, b"")
 
     adapter.control(SESSION, INTERRUPT_CONTROL)
@@ -281,6 +291,8 @@ def test_an_interrupt_forces_one_listen_unit_that_ends_the_turn() -> None:
     following = adapter.build(SESSION, audio_chunk, step_plan_payload(request))
 
     assert (interrupted.is_listen_forced, interrupted.is_interrupted) == (True, True)
+    assert interrupted.input_ids.tolist() == interrupted_input_ids
+    assert following.input_ids.tolist() == [SPECIAL_TOKENS.unit_end, PLAIN_TOKEN_ID]
     assert result.data == dict(
         talker_conditions=[], text="", is_listen=True, end_of_turn=True
     )
