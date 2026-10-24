@@ -10,10 +10,12 @@ const appSource = readFileSync(new URL("./app.js", import.meta.url), "utf8").rep
 const settingsSource = readFileSync(new URL("../../../realtime/frontend/orb/settings.js", import.meta.url), "utf8");
 const pageSource = readFileSync(new URL("./index.html", import.meta.url), "utf8");
 
-// The page with a settings panel that answers the given session options; locks records what the page asked the panel to lock.
+// The page with a settings panel that answers the given session options; locks records what the page asked the panel to lock
+// and panelOptions what it constructed the panel with.
 function createApp(sessionOptions) {
   const sockets = [];
   const locks = [];
+  const panelOptions = [];
   const elements = new Map();
   const context = vm.createContext({
     DuplexSession,
@@ -38,6 +40,7 @@ function createApp(sessionOptions) {
     requestAnimationFrame() {},
     Orb: class {},
     Settings: class {
+      constructor(ui, options) { panelOptions.push(options); }
       async init() {}
       lock(locked) { locks.push(locked); }
       sessionOptions() { return sessionOptions; }
@@ -83,6 +86,7 @@ function createApp(sessionOptions) {
   return {
     sockets,
     locks,
+    panelOptions,
     connect: () => vm.runInContext("connect()", context),
     settled: () => vm.runInContext("eventChain", context),
   };
@@ -106,6 +110,12 @@ test("the page has every element and every session.js export the shared settings
   const session = await import("./session.js");
   assert.ok(importedNames.length > 0);
   assert.deepEqual(importedNames.filter((name) => typeof session[name] !== "function"), []);
+});
+
+test("the page offers no text-only replies, since its captions and truncate follow audio playback", () => {
+  const app = createApp({ instructions: "", outputModalities: ["audio"], extension: {}, turnDetection: null });
+  assert.equal(app.panelOptions.length, 1);
+  assert.equal(app.panelOptions[0].offersTextOnly, false);
 });
 
 test("the page sends only output_modalities while the panel is empty and the chosen settings otherwise, locked during the call", async () => {
