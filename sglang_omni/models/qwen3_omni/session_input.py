@@ -116,7 +116,7 @@ class QwenInputHooks(SessionHooks):
         )
 
     def emit_truncate(
-        self, state: QwenInputState, turn: int | None, audio_end_ms: float
+        self, state: QwenInputState, turn: int, audio_end_ms: float
     ) -> None:
         # Note (Junnan Li): The truncate names its reply in the payload; a chunk of an interrupted turn would not pass the model node's edge.
         state.emit(
@@ -212,8 +212,11 @@ class QwenInputHooks(SessionHooks):
                 pass
             return payload
         elif event_type == REPLY_DELIVERED:
-            # Note (ruoyu): The thinker only ever cuts a reply further, so this report and the client's truncate keep the smaller of the delivered and the heard audio in either order, and the delivered audio alone bounds a reply the client never truncates.
-            self.emit_truncate(state, chunk.turn, float(chunk.payload["audio_ms"]))
+            # Note (ruoyu): The thinker keeps the smaller cut, so the delivered and the client truncate combine in either order.
+            if chunk.turn is None:
+                pass
+            else:
+                self.emit_truncate(state, chunk.turn, float(chunk.payload["audio_ms"]))
             return payload
         elif event_type == SPEECH_STARTED and state.answering is not None:
             self.interrupt(state)
