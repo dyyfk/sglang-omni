@@ -7,7 +7,7 @@ import asyncio
 import multiprocessing
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event
 from pathlib import Path
@@ -337,7 +337,7 @@ async def test_interrupt_drops_queued_stale_output_but_not_the_next_turn(
 ):
     """Declared downstream first, the nodes still open upstream first, take the interrupt upstream first and close downstream first.
 
-    With the realtime pending limit, the interrupt meets appends of the turn that the target's node session has not sent yet, and drops them.
+    With the realtime pending limit, the interrupt meets appends of the turn that the target's node session has not sent yet, and drops them. The client's EOS still drains the graph afterwards.
     """
     graph = cascade_graph(order=("tts", "llm", "front"))
     async with open_graph(
@@ -355,7 +355,7 @@ async def test_interrupt_drops_queued_stale_output_but_not_the_next_turn(
         await settle()
         assert log.of("append", "tts") == ["text:llm(old0)"]
         tts_node = coordinator.sessions[coordinator.graphs[identity.id].nodes["tts"].id]
-        assert len(tts_node.pending) == unsent_appends
+        await wait_until(lambda: len(tts_node.pending) == unsent_appends)
         await append(coordinator, identity, speech_chunk(3, turn=1))
         await wait_until(lambda: log.names("control") == ["llm", "tts"])
         gates.release("tts")
@@ -363,6 +363,13 @@ async def test_interrupt_drops_queued_stale_output_but_not_the_next_turn(
         output = await next_data(outputs)
         assert output.payload == {"text": "tts(llm(new))"}
         assert log.of("append", "tts") == ["text:llm(old0)", "text:llm(new)"]
+        await append(
+            coordinator, identity, replace(text_chunk("end", 5, turn=2), eos=True)
+        )
+        while (
+            output := await asyncio.wait_for(anext(outputs), OUTPUT_TIMEOUT_S)
+        ).kind != "input_done" or output.input_seq != 5:
+            pass
         await outputs.aclose()
         await coordinator.close_session(identity)
         await wait_until(lambda: log.names("close") == ["tts", "llm"])

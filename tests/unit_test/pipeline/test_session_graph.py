@@ -631,7 +631,7 @@ async def test_an_interrupted_node_publishes_only_the_end_of_the_interrupted_tur
 
 
 def bounded_reader_runtime(sessions: SessionGraphRunner) -> SessionGraphRuntime:
-    """A reply node whose text_delta a reader takes over an edge holding one chunk; the client's interrupt reaches both, and no forwarder drains the reader."""
+    """A reply node whose text_delta a reader takes over an edge holding one chunk, and then an observer the interrupt does not reach; the client's interrupt reaches the reply and the reader, and no forwarder drains either reader."""
     interrupt = ControlEdge("input", "interrupt")
     nodes = {
         "reply": SessionNode(("reply",), ("input",), controls=(interrupt,)),
@@ -640,6 +640,7 @@ def bounded_reader_runtime(sessions: SessionGraphRunner) -> SessionGraphRuntime:
             (DataEdge("reply:text_delta", capacity=1),),
             controls=(interrupt,),
         ),
+        "observer": SessionNode(("observer",), ("reply:text_delta",)),
     }
     identities = {name: SessionIdentity(f"graph:{name}") for name in nodes}
     for name, identity in identities.items():
@@ -664,7 +665,7 @@ def bounded_reader_runtime(sessions: SessionGraphRunner) -> SessionGraphRuntime:
 
 @pytest.mark.asyncio
 async def test_a_producer_held_on_a_full_edge_drops_a_turn_interrupted_meanwhile():
-    """A chunk that passed the fence and then waited for room on a reader's edge must not reach the client once its turn was interrupted during the wait."""
+    """A chunk that passed the fence and then waited for room on a reader's edge must reach neither the client nor the readers after that one once its turn was interrupted during the wait."""
     sessions = NodeOutputsRunner(
         [
             reply_output("text_delta", {"text": "first"}, 1),
@@ -687,6 +688,9 @@ async def test_a_producer_held_on_a_full_edge_drops_a_turn_interrupted_meanwhile
         ({"type": "turn.interrupted"}, 1),
         ({"text": "next"}, 2),
     ]
+    assert [
+        (chunk.payload, chunk.turn) for _, chunk, _ in graph.inboxes["observer"].queued
+    ] == [({"text": "first"}, 1), ({"text": "next"}, 2)]
 
 
 def report_runtime(sessions: SessionGraphRunner) -> SessionGraphRuntime:
