@@ -48,6 +48,7 @@ RUNTIME_LOGGER_NAME = "sglang_omni.serve.realtime.runtime"
 UPDATE_DEADLINE_S = 600.0
 CANCELLED_RESPONSE_ID = "resp_1"
 CANCELLED_ITEM_ID = "item_1"
+TEST_WAIT_TIMEOUT_SECONDS = 5.0
 
 
 class GatedAdapter(InteractionAdapter):
@@ -444,3 +445,19 @@ def test_a_cancelled_response_drops_only_its_queued_audio() -> None:
         cancelled_audio_done,
         cancelled_finished,
     ]
+
+
+@pytest.mark.asyncio
+async def test_competing_closes_keep_initial_failure_reason() -> None:
+    """Concurrent close requests must preserve the initial failure reported to clients."""
+    runtime = await open_runtime(GatedAdapter([]))
+    try:
+        runtime.fail("context full", "context_exhausted")
+        await asyncio.wait_for(
+            asyncio.gather(runtime.close("disconnect"), runtime.close("client_closed")),
+            TEST_WAIT_TIMEOUT_SECONDS,
+        )
+    finally:
+        await asyncio.wait_for(runtime.close("disconnect"), TEST_WAIT_TIMEOUT_SECONDS)
+
+    assert runtime.close_reason == "context_exhausted"
