@@ -33,9 +33,10 @@ uv pip install --prerelease=allow --find-links ./wheels -e .   # or "sglang-omni
 | `[fishaudio]` extra and the CI image | `descript-audiotools` requires `protobuf<3.20,>=3.9.2` | The override keeps protobuf 6.x. `audiotools` reaches protobuf only through `torch.utils.tensorboard`, which the installed TensorBoard supports, and the CI import probe imports `dac` on every run. |
 | Every CUDA path | `decord 0.6.0 is not supported on this platform` (pip) or `The package decord was built for a different platform` (uv) | The wheel is published as `py3-none-manylinux2010_x86_64`, but its WHEEL file records the tag `cp36-cp36m`. decord loads `libdecord.so` through ctypes, and the MiniCPM-o video frontend decodes with it on Python 3.12. |
 
-The two tools word the lines differently, and `uv pip check` exits with status 1 whenever it prints one, so its exit status is not a gate. The script below runs the same comparison with the interpreter it is started with and fails only on a line outside this table:
+The two tools word the lines differently, and `uv pip check` exits with status 1 whenever it prints one, so its exit status is not a gate. A source checkout has a script that runs the same comparison with the interpreter it is started with and fails only on a line outside this table. The PyPI package does not include it, so run it from the root of the checkout, for example after [installing from source](./installation.md#install-from-source), with the environment's Python:
 
 ```bash
+cd sglang-omni   # the root of the source checkout
 python .github/scripts/check_omni_installed_requirements.py
 ```
 
