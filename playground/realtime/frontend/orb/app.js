@@ -18,6 +18,8 @@ const QUIET_RMS = 0.01;
 const UNMUTE_QUIET_MS = 400;
 // The stop button is offered while the model has been audible this recently.
 const INTERRUPT_WINDOW_MS = 1500;
+// The server's confirmation of a stop stays on the status line this long.
+const STOPPED_HOLD_MS = 2000;
 // Speech has gaps between syllables; a mood holds this long after the last loud frame.
 const MODEL_HOLD_MS = 700;
 const MIC_HOLD_MS = 400;
@@ -64,6 +66,8 @@ let mutedResponse = false;
 let mutedQuietMs = 0;
 // A response is open but has not produced audio yet.
 let awaitingAudio = false;
+// When the server last confirmed a stop with a cancelled response.done.
+let stoppedAt = -Infinity;
 let lastSpokeAt = 0;
 let lastModelLoudAt = -Infinity;
 let lastMicLoudAt = -Infinity;
@@ -124,6 +128,10 @@ function setButtons() {
   ui.muteBtn.title = muted ? "Unmute microphone" : "Mute microphone";
   ui.micOn.hidden = muted;
   ui.micOff.hidden = !muted;
+  // Note (ruoyu): The button stops the reply on the server only where the grant says so; elsewhere it mutes playback and the model keeps talking.
+  const stopLabel = session && session.cancellable ? "Stop the current answer" : "Mute the current answer here (the model keeps talking)";
+  ui.interruptBtn.title = stopLabel;
+  ui.interruptBtn.setAttribute("aria-label", stopLabel);
   const offerCamera = OFFER_CAMERA && Boolean(session && session.imageGranted && isReady());
   ui.cameraBtn.hidden = !offerCamera;
   ui.cameraBtn.disabled = startingCamera;
@@ -157,13 +165,20 @@ function mood(micLevel, modelLevel, now) {
     if (remoteBusy) return { mood: "idle", level: 0, line: "Someone else is talking to it, try again soon" };
     return { mood: "idle", level: 0, line: "" };
   }
+  if (session.stopPending) return { mood: "thinking", level: 0, line: "Stopping…" };
+  if (now - stoppedAt < STOPPED_HOLD_MS) return { mood: "listening", level: micLevel, line: "Stopped" };
   if (session.turnBased) return turnMood(micLevel, modelLevel, now);
   if (now - lastModelLoudAt < MODEL_HOLD_MS) return { mood: "speaking", level: modelLevel, line: "" };
   if (muted) return { mood: "idle", level: 0, line: "Microphone muted" };
   if (!captureStream) return { mood: "idle", level: 0, line: startingMic ? "Allow the microphone to start" : "Microphone off" };
   if (now - lastMicLoudAt < MIC_HOLD_MS) return { mood: "user", level: micLevel, line: "Listening" };
   if (session.responseOpen && awaitingAudio) return { mood: "thinking", level: 0, line: "Thinking…" };
-  return { mood: "listening", level: micLevel, line: "Listening" };
+  return listeningMood(micLevel);
+}
+
+// While the stop button's local mute lasts, the line says so instead of Listening.
+function listeningMood(micLevel) {
+  return { mood: "listening", level: micLevel, line: mutedResponse && !session.cancellable ? "Muted locally" : "Listening" };
 }
 
 // Turn-based servers announce the user's speech and the reply, so the orb follows those events;
@@ -174,7 +189,7 @@ function turnMood(micLevel, modelLevel, now) {
   if (session.responseOpen || now - lastModelLoudAt < MODEL_HOLD_MS) return { mood: "speaking", level: modelLevel, line: "" };
   if (muted) return { mood: "idle", level: 0, line: "Microphone muted" };
   if (!captureStream) return { mood: "idle", level: 0, line: startingMic ? "Allow the microphone to start" : "Microphone off" };
-  return { mood: "listening", level: micLevel, line: "Listening" };
+  return listeningMood(micLevel);
 }
 
 function render(now) {
@@ -191,7 +206,10 @@ function render(now) {
 }
 
 function tick() {
-  ui.interruptBtn.disabled = mutedResponse || !isOpen() || performance.now() - lastModelLoudAt > INTERRUPT_WINDOW_MS;
+  const audible = performance.now() - lastModelLoudAt <= INTERRUPT_WINDOW_MS;
+  // A server stop is offered for the whole reply; a local mute only while there is something to hear.
+  const stoppable = Boolean(session) && session.cancellable && session.responseOpen;
+  ui.interruptBtn.disabled = mutedResponse || !isOpen() || !(audible || stoppable);
   let label;
   let pill;
   if (isOpen() && sessionStart !== null) {
@@ -391,14 +409,19 @@ function sessionListeners(activeSession) {
       // answer in turns lift the mute at the next response.created; models that
       // stream one response for the whole session lift it once they fall quiet.
       if (mutedResponse) {
+        // Note (ruoyu): A server that stops the reply ends it with response.done, so its mute lifts at the next reply, not on quiet audio still in flight.
+        if (activeSession.cancellable) return;
         mutedQuietMs = rmsOf(samples) < QUIET_RMS ? mutedQuietMs + (samples.length * 1000) / playbackContext.sampleRate : 0;
         if (mutedQuietMs < UNMUTE_QUIET_MS) return;
         mutedResponse = false;
       }
       playbackNode.port.postMessage({ type: "push", samples, responseId }, [samples.buffer]);
     },
-    response: ({ open, id, status }) => {
+    response: ({ open, id, status, stopConfirmed }) => {
       if (open) mutedResponse = false;
+      // A new reply supersedes the stop feedback; only the server's cancelled response.done confirms a stop.
+      if (open) stoppedAt = -Infinity;
+      else if (stopConfirmed) stoppedAt = performance.now();
       awaitingAudio = open;
       setButtons();
       if (playbackNode) {
@@ -432,6 +455,7 @@ async function connect() {
   stopCamera();
   sessionStart = null;
   muted = false;
+  stoppedAt = -Infinity;
   session = null;
   renderTranscript();
   warn("");
@@ -575,6 +599,7 @@ async function closeNow() {
 function interrupt() {
   mutedResponse = true;
   mutedQuietMs = 0;
+  if (session) session.cancelReply();
   if (playbackNode) playbackNode.port.postMessage({ type: "clear" });
   setButtons();
 }

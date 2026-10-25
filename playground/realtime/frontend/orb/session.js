@@ -62,6 +62,8 @@ export class DuplexSession {
     this.unitAudio = new Map();
     this.responseOpen = false;
     this.responseId = null;
+    // A response.cancel was sent for the open reply and its response.done has not arrived.
+    this.stopPending = false;
     // Turn-based servers report the user's speech from their VAD.
     this.userSpeaking = false;
     this.transcript = "";
@@ -101,6 +103,18 @@ export class DuplexSession {
 
   get turnBased() {
     return Boolean(this.granted) && this.granted.interaction === "turn_based";
+  }
+
+  // Whether the server stops its open reply on response.cancel; otherwise a page can only mute its playback.
+  get cancellable() {
+    return Boolean(this.granted) && this.granted.supports_cancel === true;
+  }
+
+  // Asks the server to stop the open reply, once; its response.done then says whether it was cancelled.
+  cancelReply() {
+    if (this.state !== "ready" || !this.cancellable || !this.responseOpen || this.stopPending) return;
+    this.stopPending = true;
+    this.send("response.cancel");
   }
 
   get unitMs() {
@@ -367,12 +381,16 @@ export class DuplexSession {
         this.transcript += event.delta || "";
         this.emit("text", event.delta || "");
         break;
-      case "response.done":
+      case "response.done": {
+        const status = event.response && event.response.status;
+        const stopConfirmed = this.stopPending && status === "cancelled";
+        this.stopPending = false;
         this.responseOpen = false;
         this.responseId = null;
         if (this.transcript && !this.transcript.endsWith("\n")) this.transcript += "\n";
-        this.emit("response", { open: false, id: event.response && event.response.id, status: event.response && event.response.status });
+        this.emit("response", { open: false, id: event.response && event.response.id, status, stopConfirmed });
         break;
+      }
       case "sglang.unit.done":
         this.completeUnit(event);
         break;
