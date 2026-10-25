@@ -66,6 +66,7 @@ export class DuplexSession {
     this.stopPending = false;
     // Turn-based servers report the user's speech from their VAD.
     this.userSpeaking = false;
+    this.lastSpeechStartedAt = -Infinity;
     this.transcript = "";
     this.lastLatencyMs = null;
     this.errors = [];
@@ -363,6 +364,7 @@ export class DuplexSession {
       case "input_audio_buffer.speech_started":
       case "input_audio_buffer.speech_stopped":
         this.userSpeaking = event.type === "input_audio_buffer.speech_started";
+        if (this.userSpeaking) this.lastSpeechStartedAt = this.now();
         break;
       case "response.created":
         this.responseOpen = true;
