@@ -280,7 +280,7 @@ async def test_a_truncate_after_the_stop_keeps_the_reply_through_the_last_unit_t
     await run_unit(
         adapter, coordinator, 2, 1, voice(TAIL_PCM), cancel_at="after_output"
     )
-    await adapter.truncate(audio_end_ms)
+    await adapter.truncate(FIRST_ITEM, audio_end_ms)
     await run_unit(adapter, coordinator, 3, 1, voice(b"", end_of_turn=True))
     await adapter.close()
 
@@ -300,14 +300,14 @@ async def test_a_truncate_of_an_open_reply_sends_nothing_and_later_ones_only_mov
 
     await run_unit(adapter, coordinator, 0, 1, voice(HEARD_PCM))
     await run_unit(adapter, coordinator, 1, 1, voice(RUNNING_UNIT_PCM))
-    await adapter.truncate(10.0)
+    await adapter.truncate(FIRST_ITEM, 10.0)
     await run_unit(
         adapter, coordinator, 2, 1, voice(TAIL_PCM), cancel_at="before_output"
     )
-    await adapter.truncate(20.0)
-    await adapter.truncate(10.0)
-    await adapter.truncate(5.0)
-    await adapter.truncate(5.0)
+    await adapter.truncate(FIRST_ITEM, 20.0)
+    await adapter.truncate(FIRST_ITEM, 10.0)
+    await adapter.truncate(FIRST_ITEM, 5.0)
+    await adapter.truncate(FIRST_ITEM, 5.0)
     await adapter.close()
 
     assert coordinator.controlled == [
@@ -336,7 +336,7 @@ async def test_a_late_truncate_of_a_stopped_reply_never_bends_the_stop_of_the_ne
     await run_unit(adapter, coordinator, 1, 1, voice(b"", end_of_turn=True))
     await run_unit(adapter, coordinator, 2, 2, voice(NEXT_REPLY_PCM))
     await run_unit(adapter, coordinator, 3, 2, voice(NEXT_REPLY_PCM))
-    await adapter.truncate(5.0)
+    await adapter.truncate(FIRST_ITEM, 5.0)
     await adapter.cancel()
     await adapter.close()
 
@@ -370,10 +370,10 @@ async def test_a_truncate_cuts_a_reply_the_model_ended_until_the_next_reply_star
     await run_unit(
         adapter, coordinator, 1, 1, voice(RUNNING_UNIT_PCM, end_of_turn=True)
     )
-    await adapter.truncate(10.0)
-    await adapter.truncate(20.0)
+    await adapter.truncate(FIRST_ITEM, 10.0)
+    await adapter.truncate(FIRST_ITEM, 20.0)
     await run_unit(adapter, coordinator, 2, 2, voice(NEXT_REPLY_PCM))
-    await adapter.truncate(5.0)
+    await adapter.truncate(SECOND_ITEM, 5.0)
     await adapter.close()
 
     assert coordinator.controlled == [truncate_of_turn_1(10.0, 0)]
@@ -390,20 +390,52 @@ async def test_a_truncate_cuts_a_reply_the_model_ended_until_the_next_reply_star
 
 
 @pytest.mark.asyncio
+async def test_a_truncate_naming_an_earlier_reply_leaves_the_ended_latest_reply_alone() -> (
+    None
+):
+    """Two replies the model ended itself: a truncate naming the first one sends nothing, so its position never cuts the second reply, and a truncate naming the second one cuts that reply."""
+    coordinator = VoiceCoordinator()
+    adapter, events = await open_adapter(coordinator)
+
+    await run_unit(adapter, coordinator, 0, 1, voice(HEARD_PCM, end_of_turn=True))
+    await run_unit(adapter, coordinator, 1, 2, voice(NEXT_REPLY_PCM))
+    await run_unit(adapter, coordinator, 2, 2, voice(NEXT_REPLY_PCM, end_of_turn=True))
+    await adapter.truncate(FIRST_ITEM, 5.0)
+    await adapter.truncate(SECOND_ITEM, 10.0)
+    await adapter.close()
+
+    assert coordinator.controlled == [
+        (
+            TimedChunk(
+                CONTROL,
+                0,
+                0,
+                0,
+                {"type": TRUNCATE, "t_ms": 10.0, "keep_through_unit": 1},
+                format=SESSION_CONTROL,
+                turn=2,
+            ),
+            None,
+            False,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_truncate_cuts_the_stopped_reply_until_the_next_reply_starts() -> None:
     """A truncate that arrives after the stopped reply's response.done still cuts it; one with no reply yet, or after the next reply started, sends nothing and raises nothing."""
     coordinator = VoiceCoordinator()
     adapter, events = await open_adapter(coordinator)
 
-    await adapter.truncate(10.0)
+    await adapter.truncate(FIRST_ITEM, 10.0)
     await run_unit(adapter, coordinator, 0, 1, voice(HEARD_PCM))
     await run_unit(
         adapter, coordinator, 1, 1, voice(RUNNING_UNIT_PCM), cancel_at="after_output"
     )
     await run_unit(adapter, coordinator, 2, 1, voice(b"", end_of_turn=True))
-    await adapter.truncate(10.0)
+    await adapter.truncate(FIRST_ITEM, 10.0)
     await run_unit(adapter, coordinator, 3, 2, voice(NEXT_REPLY_PCM))
-    await adapter.truncate(5.0)
+    await adapter.truncate(SECOND_ITEM, 5.0)
     await adapter.close()
 
     assert coordinator.controlled == [
@@ -441,8 +473,8 @@ async def test_a_unit_delivered_in_several_chunks_is_played_once_its_last_chunk_
     await adapter.cancel()
     coordinator.done(1)
     await processing
-    await adapter.truncate(15.0)
-    await adapter.truncate(20.0)
+    await adapter.truncate(FIRST_ITEM, 15.0)
+    await adapter.truncate(FIRST_ITEM, 20.0)
     await adapter.close()
 
     assert coordinator.controlled == [

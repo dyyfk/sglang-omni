@@ -379,11 +379,15 @@ class OutputConverter:
             reply.keep_through_unit = reply.last_delivered_unit
             return KeptReply(turn=reply.turn, keep_through_unit=reply.keep_through_unit)
 
-    def truncate(self, audio_end_ms: float) -> KeptReply | None:
-        """Keep the latest reply, once the client stopped it or the model ended it, through the last unit the client had played at audio_end_ms, never past a unit it received or a unit already kept; None when the position does not move back."""
+    def truncate(self, item_id: str, audio_end_ms: float) -> KeptReply | None:
+        """Keep the latest reply, when item_id names it and the client stopped it or the model ended it, through the last unit the client had played at audio_end_ms, never past a unit it received or a unit already kept; None when the position does not move back."""
         reply = self.reply
-        if reply is None or (reply.is_open and not reply.is_cancelled):
-            # note (ruoyu): A truncate carries no item yet, so one meant for the reply before an open reply would cut the open one; the client stops a reply before it truncates it.
+        if (
+            reply is None
+            or reply.item_id != item_id
+            or (reply.is_open and not reply.is_cancelled)
+        ):
+            # note (luojiaxuan): Only the latest reply's units are still in reach of a cut, and an open reply the client has not stopped goes on past any cut.
             return None
         else:
             keep_through_unit = reply.played_through_unit(audio_end_ms)
@@ -520,10 +524,10 @@ class RealtimeAdapter(CoordinatorAdapter):
                 ),
             )
 
-    async def truncate(self, audio_end_ms: float) -> None:
-        """Cut the stopped reply where the client stopped playing it: the thinker keeps it through the last unit whose audio had ended by then and forgets the rest, never more than the stop already kept."""
+    async def truncate(self, item_id: str, audio_end_ms: float) -> None:
+        """Cut the reply item_id names where the client stopped playing it: the thinker keeps it through the last unit whose audio had ended by then and forgets the rest, never more than the stop already kept."""
         assert self.session_identity is not None
-        kept_reply = self.output_converter.truncate(audio_end_ms)
+        kept_reply = self.output_converter.truncate(item_id, audio_end_ms)
         if kept_reply is None:
             pass
         else:
