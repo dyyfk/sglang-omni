@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import math
+import wave
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -12,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from sglang_omni.audio.vad import StatelessVAD
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.minicpm_o.components.streaming_perception import (
@@ -36,7 +39,13 @@ from sglang_omni.models.minicpm_o.thinker_state import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import SessionIdentity, TimedChunk
-from sglang_omni.proto.streams import CONTROL, INTERRUPT, SESSION_CONTROL, TRUNCATE
+from sglang_omni.proto.streams import (
+    CONTROL,
+    INTERRUPT,
+    PCM16_BYTES_PER_SAMPLE,
+    SESSION_CONTROL,
+    TRUNCATE,
+)
 from sglang_omni.scheduling.sglang_backend.ar_session import ARSessionPreparation
 from sglang_omni.scheduling.sglang_backend.request_data import (
     EmbeddingSpan,
@@ -75,14 +84,15 @@ UNIT_PROMPT_LENGTHS = (
 AUDIO_PLACEHOLDER_ID_BASE = 80
 # The listen units after a reply's last spoken unit within which the thinker still cuts the reply.
 TRUNCATE_WINDOW_UNITS = 10
-# Input levels as RMS of full scale: a room's noise floor under an auto-gain microphone, and a voice.
-NOISE_FLOOR_RMS = 0.012
-VOICE_RMS = 0.1
-# A tone in the speech band stands in for a voice.
-VOICE_TONE_HZ = 440
-# A short soft word: 80 ms of 16 kHz input, whose average over a whole unit is below the noise floor's.
-SOFT_WORD_SAMPLES = SAMPLE_RATE * 80 // 1000
-SOFT_WORD_RMS = 0.04
+# note (luojiaxuan): 16 kHz mono PCM16 speech, voiced throughout from 3 s to 4 s.
+SPEECH_FIXTURE = Path(__file__).resolve().parents[2] / "data" / "query_to_draw.wav"
+VOICED_START_SAMPLE = 3 * SAMPLE_RATE
+# note (luojiaxuan): Input levels as RMS in dB of full scale: a voice under an auto-gain microphone, a voice from a quiet microphone with no gain control, and a loud room's steady noise.
+VOICE_DBFS = -20
+QUIET_VOICE_DBFS = -45
+LOUD_ROOM_DBFS = -20
+SHORT_WORD_SAMPLES = SAMPLE_RATE * 300 // 1000
+SILENT_UNIT_PCM = bytes(UNIT_SAMPLES * PCM16_BYTES_PER_SAMPLE)
 
 
 def session_control(payload: dict[str, object]) -> TimedChunk:
@@ -103,13 +113,18 @@ def audio_unit(input_seq: int, payload: bytes | dict[str, object] = b"") -> Time
     return TimedChunk("audio", input_seq * 1000, 1000, input_seq, payload)
 
 
-def unit_pcm(rms: float, *, voiced_samples: int = UNIT_SAMPLES) -> bytes:
-    """One unit of 16 kHz PCM16 input, silent but for a speech-band tone of this RMS over its last voiced_samples samples."""
-    samples = np.zeros(UNIT_SAMPLES, dtype=np.float64)
-    samples[UNIT_SAMPLES - voiced_samples :] = (
-        rms
-        * math.sqrt(2)
-        * np.sin(2 * math.pi * VOICE_TONE_HZ * np.arange(voiced_samples) / SAMPLE_RATE)
+def speech(sample_count: int) -> np.ndarray:
+    """sample_count voiced samples of the speech fixture, in full-scale units."""
+    with wave.open(str(SPEECH_FIXTURE)) as speech_file:
+        speech_file.setpos(VOICED_START_SAMPLE)
+        return np.frombuffer(speech_file.readframes(sample_count), dtype="<i2") / 32768
+
+
+def unit_pcm(signal: np.ndarray, dbfs: float) -> bytes:
+    """One unit of 16 kHz PCM16 input, silent but for signal, scaled to an RMS of dbfs, over its last samples."""
+    samples = np.zeros(UNIT_SAMPLES)
+    samples[UNIT_SAMPLES - len(signal) :] = (
+        signal * 10 ** (dbfs / 20) / np.sqrt(np.mean(signal**2))
     )
     return np.round(samples * 32768).astype("<i2").tobytes()
 
@@ -227,7 +242,10 @@ def session_state(
     **sampling_overrides: float | int | bool,
 ) -> MiniCPMOThinkerSessionState:
     sampling = {"greedy": True, "repetition_penalty": 1.0, **sampling_overrides}
-    return MiniCPMOThinkerSessionState(sampling=MiniCPMODuplexSampling(**sampling))
+    return MiniCPMOThinkerSessionState(
+        sampling=MiniCPMODuplexSampling(**sampling),
+        speech_detector=Mock(spec=StatelessVAD),
+    )
 
 
 def unit_request(
@@ -400,7 +418,12 @@ def test_a_stop_holds_the_listen_through_silence_until_the_user_speaks(
     finished_units = listen_after_a_stop(
         adapter,
         request,
-        [unit_pcm(0.0), unit_pcm(0.0), unit_pcm(VOICE_RMS), unit_pcm(0.0)],
+        [
+            SILENT_UNIT_PCM,
+            SILENT_UNIT_PCM,
+            unit_pcm(speech(UNIT_SAMPLES), VOICE_DBFS),
+            SILENT_UNIT_PCM,
+        ],
     )
 
     assert [unit_request.is_listen_forced for unit_request, _ in finished_units] == [
@@ -423,14 +446,24 @@ def test_a_stop_holds_the_listen_through_silence_until_the_user_speaks(
 @pytest.mark.parametrize(
     ("payload", "is_listen_held"),
     [
-        (unit_pcm(NOISE_FLOOR_RMS), True),
-        (unit_pcm(SOFT_WORD_RMS, voiced_samples=SOFT_WORD_SAMPLES), False),
-        ({"pcm": unit_pcm(0.0), "images": [b"frame"]}, True),
-        ({"pcm": unit_pcm(VOICE_RMS), "images": [b"frame"]}, False),
+        (
+            unit_pcm(
+                np.random.default_rng(0).standard_normal(UNIT_SAMPLES), LOUD_ROOM_DBFS
+            ),
+            True,
+        ),
+        (unit_pcm(speech(UNIT_SAMPLES), QUIET_VOICE_DBFS), False),
+        (unit_pcm(speech(SHORT_WORD_SAMPLES), QUIET_VOICE_DBFS), False),
+        ({"pcm": SILENT_UNIT_PCM, "images": [b"frame"]}, True),
+        (
+            {"pcm": unit_pcm(speech(UNIT_SAMPLES), VOICE_DBFS), "images": [b"frame"]},
+            False,
+        ),
     ],
     ids=[
-        "a_room_noise_floor",
-        "a_short_soft_word_at_the_end_of_the_unit",
+        "a_loud_room",
+        "a_quiet_microphone",
+        "a_short_quiet_word_at_the_end_of_the_unit",
         "silence_with_a_camera_frame",
         "a_voice_with_a_camera_frame",
     ],
@@ -438,11 +471,11 @@ def test_a_stop_holds_the_listen_through_silence_until_the_user_speaks(
 def test_after_a_stop_only_the_users_voice_frees_the_model(
     payload: bytes | dict[str, object], is_listen_held: bool
 ) -> None:
-    """After a stop and a silent unit, a room's noise floor or a camera frame over silence keeps the model listening, while a short soft word, whose average over the whole unit is below the noise floor, or a voice sent with a camera frame frees it from that unit on."""
+    """After a stop and a silent unit, a loud room's steady noise or a camera frame over silence keeps the model listening, while the user's voice frees it from that unit on at any capture level: a whole unit or a short word from a quiet microphone, or a voice sent with a camera frame."""
     adapter, request = open_duplex_adapter()
 
     finished_units = listen_after_a_stop(
-        adapter, request, [unit_pcm(0.0), unit_pcm(0.0), payload, unit_pcm(0.0)]
+        adapter, request, [SILENT_UNIT_PCM, SILENT_UNIT_PCM, payload, SILENT_UNIT_PCM]
     )
 
     assert [

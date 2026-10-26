@@ -4,12 +4,12 @@
 from array import array
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import PreTrainedTokenizerBase
 
+from sglang_omni.audio.vad import StatelessVAD
 from sglang_omni.client.client import Client
 from sglang_omni.models.minicpm_o.components.code2wav import OUTPUT_SAMPLE_RATE
 from sglang_omni.models.minicpm_o.components.streaming_perception import (
@@ -64,9 +64,6 @@ from sglang_omni.serve.realtime.types import Capabilities, samples_to_ms
 
 # note (ruoyu): A client's truncate follows its stop within a unit or two; this many listen units after a reply's last spoken unit, a cut would re-feed more audio than any stop needs, so the reply is no longer cut.
 TRUNCATE_WINDOW_UNITS = 10
-# Note (ruoyu): RMS 0.0177, about -35 dBFS, is MIC_TALK_LEVEL in playground/realtime/frontend/orb/app.js, where the realtime page counts the user as talking, and 80 ms is its capture frame; a room's noise floor stays below it.
-VOICE_WINDOW_SAMPLES = SAMPLE_RATE * 80 // 1000
-VOICE_WINDOW_RMS = 0.0177
 
 
 def keep_through_unit_of(event: TimedChunk) -> int | None:
@@ -94,7 +91,8 @@ class ThinkerAdapter(ARSessionAdapter):
                     key: request.params[key]
                     for key in MiniCPMODuplexSampling.model_fields
                 }
-            )
+            ),
+            speech_detector=StatelessVAD(),
         )
 
     def close(self, session_identity: SessionIdentity) -> None:
@@ -105,6 +103,8 @@ class ThinkerAdapter(ARSessionAdapter):
             state = self.states[session_identity]
             state.is_interrupt_pending = True
             state.is_listen_held = True
+            # note (luojiaxuan): The detector hears no unit between holds, so each hold starts it afresh.
+            state.speech_detector.reset()
             state.is_latest_reply_ended = True
             self.cut_reply(state, keep_through_unit_of(event))
         elif control_type(event) == TRUNCATE:
@@ -195,16 +195,12 @@ class ThinkerAdapter(ARSessionAdapter):
                 if isinstance(chunk.payload, dict)
                 else chunk.payload
             )
-            squared_samples = (np.frombuffer(pcm, dtype="<i2") / 32768.0) ** 2
-            cumulative_squares = np.concatenate([[0.0], np.cumsum(squared_samples)])
-            window_rms = np.sqrt(
-                (
-                    cumulative_squares[VOICE_WINDOW_SAMPLES:]
-                    - cumulative_squares[:-VOICE_WINDOW_SAMPLES]
+            state.is_listen_held = all(
+                state.speech_detector.step(frame, in_speech=False) is None
+                for frame in state.speech_detector.score(
+                    pcm, round(chunk.t_start_ms * SAMPLE_RATE / 1000)
                 )
-                / VOICE_WINDOW_SAMPLES
             )
-            state.is_listen_held = bool((window_rms <= VOICE_WINDOW_RMS).all())
         else:
             pass
         prefix = (
