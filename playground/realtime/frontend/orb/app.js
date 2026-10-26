@@ -442,6 +442,8 @@ async function connect() {
   stopCamera();
   sessionStart = null;
   muted = false;
+  mutedResponse = false;
+  mutedAt = -Infinity;
   stoppedAt = -Infinity;
   session = null;
   renderTranscript();
