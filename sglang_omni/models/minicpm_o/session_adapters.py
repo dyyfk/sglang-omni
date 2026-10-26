@@ -4,6 +4,7 @@
 from array import array
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -63,6 +64,9 @@ from sglang_omni.serve.realtime.types import Capabilities, samples_to_ms
 
 # note (ruoyu): A client's truncate follows its stop within a unit or two; this many listen units after a reply's last spoken unit, a cut would re-feed more audio than any stop needs, so the reply is no longer cut.
 TRUNCATE_WINDOW_UNITS = 10
+# Note (ruoyu): RMS 0.0177, about -35 dBFS, is MIC_TALK_LEVEL in playground/realtime/frontend/orb/app.js, where the realtime page counts the user as talking, and 80 ms is its capture frame; a room's noise floor stays below it.
+VOICE_WINDOW_SAMPLES = SAMPLE_RATE * 80 // 1000
+VOICE_WINDOW_RMS = 0.0177
 
 
 def keep_through_unit_of(event: TimedChunk) -> int | None:
@@ -100,6 +104,7 @@ class ThinkerAdapter(ARSessionAdapter):
         if control_type(event) == INTERRUPT:
             state = self.states[session_identity]
             state.is_interrupt_pending = True
+            state.is_listen_held = True
             state.is_latest_reply_ended = True
             self.cut_reply(state, keep_through_unit_of(event))
         elif control_type(event) == TRUNCATE:
@@ -184,6 +189,24 @@ class ThinkerAdapter(ARSessionAdapter):
         plan: PerceptionStepPlan = payload.data
         is_interrupted = state.is_interrupt_pending
         state.is_interrupt_pending = False
+        if state.is_listen_held:
+            pcm = (
+                chunk.payload["pcm"]
+                if isinstance(chunk.payload, dict)
+                else chunk.payload
+            )
+            squared_samples = (np.frombuffer(pcm, dtype="<i2") / 32768.0) ** 2
+            cumulative_squares = np.concatenate([[0.0], np.cumsum(squared_samples)])
+            window_rms = np.sqrt(
+                (
+                    cumulative_squares[VOICE_WINDOW_SAMPLES:]
+                    - cumulative_squares[:-VOICE_WINDOW_SAMPLES]
+                )
+                / VOICE_WINDOW_SAMPLES
+            )
+            state.is_listen_held = bool((window_rms <= VOICE_WINDOW_RMS).all())
+        else:
+            pass
         prefix = (
             []
             if state.is_prefix_pending
@@ -248,6 +271,7 @@ class ThinkerAdapter(ARSessionAdapter):
             thinker_state=state,
             unit_embedding_spans=spans,
             is_listen_forced=is_interrupted
+            or state.is_listen_held
             or state.force_listen_counter < sampling.force_listen_count,
             is_interrupted=is_interrupted,
             unit_index=chunk.seq,
@@ -505,7 +529,7 @@ class RealtimeAdapter(CoordinatorAdapter):
     output_converter: OutputConverter
 
     async def cancel(self) -> None:
-        """Interrupt the open reply's turn: the turn's later audio is dropped, and the thinker forgets the units the client did not receive before it listens for the next unit."""
+        """Interrupt the open reply's turn: the turn's later audio is dropped, and the thinker forgets the units the client did not receive, then listens until the user speaks again."""
         assert self.session_identity is not None
         kept_reply = self.output_converter.cancel()
         if kept_reply is None:

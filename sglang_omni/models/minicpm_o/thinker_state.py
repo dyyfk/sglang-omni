@@ -33,6 +33,8 @@ class MiniCPMOThinkerSessionState:
     is_turn_ended: bool = True
     is_prefix_pending: bool = True
     is_interrupt_pending: bool = False
+    # Note (ruoyu): After a client stop the model, hearing only silence, resumes the stopped answer, so every unit listens until one carries the user's voice.
+    is_listen_held: bool = False
     force_listen_counter: int = 0
     generated_history: list[int] = field(default_factory=list)
     reply_units: list[ReplyUnit] = field(default_factory=list)
