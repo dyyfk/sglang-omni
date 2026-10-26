@@ -337,3 +337,30 @@ test("the stop button cancels only where granted, mutes every response id until 
     await socket.close();
   }
 });
+
+test("a stop's mute does not carry into the next session", async () => {
+  const speech = Buffer.alloc(48000, 32).toString("base64");
+  const elements = new Map();
+  const app = createApp({ elements });
+  await app.connect();
+  const socket = app.sockets.at(-1);
+  socket.open();
+  socket.receive({ type: "session.updated", session: { sglang: { granted: { interaction: "native", native_unit_ms: 1000, input_audio_format: { rate: 16000 }, output_audio_format: { rate: 24000 } } } } });
+  socket.receive({ type: "response.created", response: { id: "first" } });
+  socket.receive({ type: "response.output_audio.delta", response_id: "first", delta: speech });
+  await app.settled();
+  app.advance(100);
+  elements.get("interruptBtn").listeners.click();
+  await socket.close();
+
+  await app.connect();
+  const next = app.sockets.at(-1);
+  next.open();
+  next.receive({ type: "session.updated", session: { sglang: { granted: { interaction: "native", native_unit_ms: 1000, input_audio_format: { rate: 16000 }, output_audio_format: { rate: 24000 } } } } });
+  next.receive({ type: "response.created", response: { id: "opening" } });
+  next.receive({ type: "response.output_audio.delta", response_id: "opening", delta: speech });
+  await app.settled();
+  const playback = app.nodes[0];
+  assert.equal(playback.messages.filter((message) => message.type === "push").length, 2);
+  assert.notEqual(app.run("mood(0, 0, performance.now()).line"), "Muted until you speak");
+});
