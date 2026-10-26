@@ -481,6 +481,34 @@ def test_a_cut_refilled_reply_stays_cut_when_the_dialog_asks_the_next_turn_again
     ]
 
 
+def test_a_truncate_between_a_units_preparation_and_its_build_rebuilds_the_next_unit(
+    adapter: QwenThinkerSessionAdapter,
+) -> None:
+    """The scheduler prepares every append of a batch before it builds any, so a truncate in the same batch set the rebuild after the preparation had kept the KV, and the build sent the whole history onto that KV."""
+    first = adapter.build(IDENTITY, unit_chunk(1), payload(1, [5]))
+    finish(adapter, first, [51, 52, 53, 54, 55, END])
+    preparation = adapter.prepare_unit(IDENTITY, unit_chunk(2), payload(2, [7]))
+    assert preparation.reset_history is False
+    adapter.control(IDENTITY, truncate(1, t_ms=CODEC_FRAME_MS))
+    second = adapter.build(IDENTITY, unit_chunk(2), payload(2, [7]))
+    assert second.req.origin_input_ids == [NEWLINE, 7]
+    finish(adapter, second, [60, END])
+    assert adapter.prepare_unit(IDENTITY, unit_chunk(3), payload(3, [8])).reset_history
+    third = adapter.build(IDENTITY, unit_chunk(3), payload(3, [8]))
+    heard = PREFILL_TEXT_ROWS + 1
+    assert third.req.origin_input_ids == SYSTEM_PREFIX + [
+        5,
+        *[51, 52, 53, 54, 55][:heard],
+        END,
+        NEWLINE,
+        7,
+        60,
+        END,
+        NEWLINE,
+        8,
+    ]
+
+
 @pytest.mark.parametrize(
     "is_next_reply_finished",
     [pytest.param(True, id="finished"), pytest.param(False, id="aborted")],

@@ -72,6 +72,8 @@ class ThinkerHistory:
     pending: PendingTurn | None = None
     # Note (Junnan Li): A truncate of a committed reply cuts KV the native session cannot cut, so units re-prefill the whole history until one commits with no cut landed while it ran.
     rebuild: bool = False
+    # note (luojiaxuan): Whether the native session of the unit prepared but not yet built is reset; None when no unit waits for its build.
+    prepared_reset: bool | None = None
 
 
 def heard_tokens(audio_end_ms: float) -> int:
@@ -221,6 +223,7 @@ class QwenThinkerSessionAdapter(ARSessionAdapter):
             history.rebuild = True
         else:
             pass
+        history.prepared_reset = history.rebuild
         return ARSessionPreparation(reset_history=history.rebuild)
 
     def build(
@@ -273,7 +276,14 @@ class QwenThinkerSessionAdapter(ARSessionAdapter):
         prefix_model_inputs = unit_model_inputs
         unit_ids = [*unit_ids, *prompt_ids]
         unit_model_inputs = merge_model_inputs(unit_model_inputs, model_inputs)
-        native_ids = [*history.ids, *unit_ids] if history.rebuild else unit_ids
+        # note (luojiaxuan): A truncate between the unit's preparation and its build cannot reset the KV the preparation kept, so the unit appends to it and leaves the rebuild to the next unit.
+        is_reset = (
+            history.rebuild
+            if history.prepared_reset is None
+            else history.prepared_reset
+        )
+        history.prepared_reset = None
+        native_ids = [*history.ids, *unit_ids] if is_reset else unit_ids
         pipeline_state.prompt = {
             "input_ids": torch.tensor(native_ids, dtype=torch.long),
             "attention_mask": torch.ones(len(native_ids), dtype=torch.long),
@@ -298,6 +308,7 @@ class QwenThinkerSessionAdapter(ARSessionAdapter):
             prompt_start=prompt_start,
             prefix_model_inputs=prefix_model_inputs,
             refilled_turn=refilled_turn,
+            has_stale_kv=history.rebuild and not is_reset,
         )
         return request_data
 
